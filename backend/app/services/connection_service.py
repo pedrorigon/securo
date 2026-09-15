@@ -2123,7 +2123,10 @@ async def _assign_connection_credit_card_bills(
             if tx.bill_id != target.id:
                 tx.bill_id = target.id
             if tx.effective_bill_date is None:
-                tx.effective_bill_date = target.due_date
+                # Only the accrual date follows the bill. `effective_bill_date`
+                # is the user's manual override and buckets every accounting
+                # mode by the invoice — stamping it here would drag cash-mode
+                # months onto the bill due date.
                 tx.effective_date = target.due_date
         # Forecast bills have no provider total: derive it from their ledger.
         bills = (
@@ -2243,12 +2246,10 @@ async def _sync_credit_card_bills(
                         .where(
                             Transaction.bill_id == bill.id,
                             Transaction.source == "sync",
-                            Transaction.effective_bill_date == old_due,
+                            Transaction.effective_bill_date.is_(None),
+                            Transaction.effective_date == old_due,
                         )
-                        .values(
-                            effective_bill_date=bd.due_date,
-                            effective_date=bd.due_date,
-                        )
+                        .values(effective_date=bd.due_date)
                     )
                 continue
             bill = CreditCardBill(
@@ -2276,12 +2277,10 @@ async def _sync_credit_card_bills(
                     .where(
                         Transaction.bill_id == bill.id,
                         Transaction.source == "sync",
-                        Transaction.effective_bill_date == old_due,
+                        Transaction.effective_bill_date.is_(None),
+                        Transaction.effective_date == old_due,
                     )
-                    .values(
-                        effective_bill_date=bd.due_date,
-                        effective_date=bd.due_date,
-                    )
+                    .values(effective_date=bd.due_date)
                 )
 
     await session.flush()
