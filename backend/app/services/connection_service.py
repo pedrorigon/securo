@@ -1827,6 +1827,202 @@ async def _find_or_create_forecast_bill(
     return bill
 
 
+# Some connectors (e.g. BTG) only send an installment once the bank charges
+# it, even though the metadata already describes the whole plan
+# (`installmentNumber` / `totalInstallments` / `billForecastDate`). Project the
+# remaining rows as pending transactions on the invoice they will land on, so
+# the bank app's future bills have something to match. Existing projections are
+# never rewritten, and each one is dropped as soon as the provider sends the
+# real installment (the projection's category carries over if the real row
+# arrives uncategorized).
+_PROJECTED_INSTALLMENT_PREFIX = "projected:"
+
+
+def _cc_metadata(tx: Transaction) -> dict:
+    raw = tx.raw_data if isinstance(tx.raw_data, dict) else {}
+    meta = raw.get("creditCardMetadata")
+    return meta if isinstance(meta, dict) else {}
+
+
+def _installment_merchant_key(tx: Transaction) -> str:
+    name = tx.original_description or tx.description or ""
+    # Providers append the parcel suffix to every row ("... 01/06"); strip it
+    # so all installments of one plan share the same key.
+    name = re.sub(r"\s*\d{1,2}\s*/\s*\d{1,2}\s*$", "", name)
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _installment_forecast_month(forecast: object) -> Optional[tuple[int, int]]:
+    match = re.match(r"^(\d{4})-(\d{2})", str(forecast or ""))
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _shift_month(year: int, month: int, offset: int) -> tuple[int, int]:
+    month += offset
+    year += (month - 1) // 12
+    month = (month - 1) % 12 + 1
+    return year, month
+
+
+def _installment_plan_key(tx: Transaction) -> Optional[tuple]:
+    """Fingerprint tying a plan's installments together across months."""
+    meta = _cc_metadata(tx)
+    number = meta.get("installmentNumber")
+    total = meta.get("totalInstallments")
+    if not number or not total:
+        return None
+    month = _installment_forecast_month(meta.get("billForecastDate"))
+    if month is None:
+        # Some connectors (Itaú) omit billForecastDate: their installments are
+        # dated on the bill's own due date, so the row's month is the
+        # competency.
+        month = (tx.date.year, tx.date.month)
+    return (
+        _installment_merchant_key(tx),
+        Decimal(tx.amount),
+        int(total),
+        int(number),
+        month,
+    )
+
+
+def _installment_bucket(key: tuple) -> tuple:
+    """Plan identity without the amount: merchant, plan size, parcel, month."""
+    merchant_key, _, total, number, month = key
+    return (merchant_key, total, number, month)
+
+
+# The first installment often differs by a few cents from the rest (rounding),
+# so plan matching compares amounts with a small tolerance.
+_INSTALLMENT_AMOUNT_TOLERANCE = Decimal("0.05")
+
+
+async def _sync_projected_installments(
+    session: AsyncSession,
+    account: Account,
+    transactions: list[Transaction],
+) -> list[Transaction]:
+    """Materialize the installments the provider hasn't charged yet."""
+    real_amounts: dict[tuple, list[Decimal]] = {}
+    real_numbers: dict[tuple, set[int]] = {}
+    projected: dict[tuple, Transaction] = {}
+    for tx in transactions:
+        key = _installment_plan_key(tx)
+        if key is None:
+            continue
+        merchant_key, amount, total, number, month = key
+        bucket = (merchant_key, total, number, month)
+        if (tx.external_id or "").startswith(_PROJECTED_INSTALLMENT_PREFIX):
+            projected.setdefault(bucket, tx)
+        else:
+            real_amounts.setdefault(bucket, []).append(amount)
+            real_numbers.setdefault((merchant_key, total), set()).add(number)
+
+    def plan_present(bucket: tuple, amount: Decimal) -> bool:
+        return any(
+            abs(existing - amount) <= _INSTALLMENT_AMOUNT_TOLERANCE
+            for existing in real_amounts.get(bucket, ())
+        )
+
+    created: list[Transaction] = []
+    for tx in transactions:
+        if (tx.external_id or "").startswith(_PROJECTED_INSTALLMENT_PREFIX):
+            continue
+        key = _installment_plan_key(tx)
+        if key is None:
+            continue
+        merchant_key, amount, total, number, month = key
+        if len(real_numbers.get((merchant_key, total), ())) >= total:
+            # The provider already sent every installment of this plan (even
+            # when it lumped the dates); there is nothing to project.
+            continue
+        today = date.today()
+        for installment in range(number + 1, total + 1):
+            target = _shift_month(month[0], month[1], installment - number)
+            if target < (today.year, today.month):
+                # Competencies already gone by: whatever was charged lives in
+                # the ledger (or was never sent by the provider).
+                continue
+            bucket = (merchant_key, total, installment, target)
+            if bucket in projected or plan_present(bucket, amount):
+                continue
+            due = _bill_due_on_next_business_day(
+                target[0], target[1], account.payment_due_day or 1
+            )
+            projection = Transaction(
+                user_id=tx.user_id,
+                workspace_id=tx.workspace_id,
+                account_id=account.id,
+                category_id=tx.category_id,
+                external_id=(
+                    f"{_PROJECTED_INSTALLMENT_PREFIX}{tx.external_id}:{installment}"
+                ),
+                description=tx.description,
+                original_description=tx.original_description,
+                description_is_rule_managed=tx.description_is_rule_managed,
+                amount=tx.amount,
+                currency=tx.currency,
+                amount_primary=tx.amount_primary,
+                fx_rate_used=tx.fx_rate_used,
+                date=due,
+                effective_date=due,
+                type=tx.type,
+                source="sync",
+                status="pending",
+                installment_number=installment,
+                total_installments=total,
+                installment_total_amount=tx.installment_total_amount,
+                installment_purchase_date=tx.installment_purchase_date,
+                payee=tx.payee,
+                payee_id=tx.payee_id,
+                raw_data={
+                    "creditCardMetadata": {
+                        "installmentNumber": installment,
+                        "totalInstallments": total,
+                        "billForecastDate": f"{target[0]:04d}-{target[1]:02d}",
+                        "projected": True,
+                        "projectedFrom": tx.external_id,
+                    }
+                },
+            )
+            session.add(projection)
+            created.append(projection)
+            projected[bucket] = projection
+
+    # The provider finally charged an installment we had projected: the real
+    # row takes over, keeping whatever the user had done to the projection.
+    for bucket, projection in projected.items():
+        if not plan_present(bucket, Decimal(projection.amount)):
+            continue
+
+        def matches_real(tx: Transaction) -> bool:
+            if (tx.external_id or "").startswith(_PROJECTED_INSTALLMENT_PREFIX):
+                return False
+            key = _installment_plan_key(tx)
+            if key is None:
+                return False
+            return (
+                _installment_bucket(key) == bucket
+                and abs(Decimal(tx.amount) - Decimal(projection.amount))
+                <= _INSTALLMENT_AMOUNT_TOLERANCE
+            )
+
+        real_tx = next((tx for tx in transactions if matches_real(tx)), None)
+        if (
+            real_tx is not None
+            and real_tx.category_id is None
+            and projection.category_id is not None
+        ):
+            real_tx.category_id = projection.category_id
+        await session.delete(projection)
+
+    if created or projected:
+        await session.flush()
+    return created
+
+
 async def _assign_connection_credit_card_bills(
     session: AsyncSession, user_id: uuid.UUID, connection: BankConnection
 ) -> None:
@@ -1852,11 +2048,16 @@ async def _assign_connection_credit_card_bills(
     for account in accounts:
         if not account.payment_due_day:
             continue
-        transactions = (
-            await session.execute(
-                select(Transaction).where(Transaction.account_id == account.id)
-            )
-        ).scalars().all()
+        transactions = list(
+            (
+                await session.execute(
+                    select(Transaction).where(Transaction.account_id == account.id)
+                )
+            ).scalars().all()
+        )
+        transactions += await _sync_projected_installments(
+            session, account, transactions
+        )
         for tx in transactions:
             raw = tx.raw_data if isinstance(tx.raw_data, dict) else {}
             meta = raw.get("creditCardMetadata")
