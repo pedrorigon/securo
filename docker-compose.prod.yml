@@ -71,7 +71,11 @@ x-backend-env: &backend-env
   AGENTS_EMBEDDING_MODEL: ${AGENTS_EMBEDDING_MODEL:-sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2}
 
 x-backend-base: &backend-base
-  image: ghcr.io/securo-finance/securo-backend:latest
+  # `cardbills` is the locally built tag carrying the credit-card invoice
+  # positioning fix (and the investment-movements sync). Pin it so a
+  # `docker compose pull` can't drop the patch; override with
+  # BACKEND_IMAGE_TAG=latest (or any other tag) when building fresh images.
+  image: ghcr.io/securo-finance/securo-backend:${BACKEND_IMAGE_TAG:-cardbills}
   environment: *backend-env
   # Lets a connection point at a model server running on the host (LM Studio,
   # Ollama, llama.cpp) as http://host.docker.internal:<port>. Docker Desktop
