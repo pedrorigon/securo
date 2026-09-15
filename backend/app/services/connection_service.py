@@ -2102,6 +2102,24 @@ async def _assign_connection_credit_card_bills(
                 )
             if target is None:
                 continue
+            if (
+                tx.effective_bill_date is not None
+                and tx.effective_bill_date != target.due_date
+                and not bill_external
+            ):
+                # The user hand-picked this invoice (issue #162) and the
+                # provider has no explicit billId contradicting it — keep the
+                # choice instead of snapping back to the metadata bill.
+                override_bill = await session.scalar(
+                    select(CreditCardBill).where(
+                        CreditCardBill.account_id == account.id,
+                        CreditCardBill.due_date == tx.effective_bill_date,
+                    )
+                )
+                override_id = override_bill.id if override_bill else None
+                if tx.bill_id != override_id:
+                    tx.bill_id = override_id
+                continue
             if tx.bill_id != target.id:
                 tx.bill_id = target.id
             if tx.effective_bill_date is None:
