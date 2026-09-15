@@ -15,6 +15,7 @@ from app.core.config import get_settings
 from app.models.asset import Asset
 from app.models.asset_group import AssetGroup
 from app.models.asset_value import AssetValue
+from app.models.asset_transaction import AssetTransaction
 from app.models.bank_connection import BankConnection
 from app.models.account import Account
 from app.models.category import Category
@@ -238,6 +239,123 @@ def _sync_assets_enabled(settings: Optional[dict]) -> bool:
     connection via Connection settings without disabling account/transaction sync.
     """
     return (settings or {}).get("sync_assets", True) is not False
+
+
+def _decimal_or_zero(value) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError):
+        return Decimal("0")
+
+
+async def _sync_asset_movements(
+    session: AsyncSession,
+    connection: BankConnection,
+    provider,
+    credentials: dict,
+    asset: Asset,
+    holding,
+) -> None:
+    """Import a holding's buy/sell movements into its asset ledger.
+
+    Providers expose investment movements on a per-investment endpoint (Pluggy:
+    `/investments/{id}/transactions`). Only buy/sell map onto the ledger's
+    `kind`; other types (interest, taxes) already land in the account statement
+    as transactions. Failures are swallowed so a brokerage hiccup can't break
+    the bank sync that just succeeded.
+    """
+    fetch = getattr(provider, "get_investment_transactions", None)
+    if fetch is None:
+        return
+    try:
+        movements = await fetch(credentials, holding.external_id)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to fetch investment movements for asset %s",
+            asset.id, exc_info=True,
+        )
+        return
+    if not movements:
+        return
+
+    existing_rows = (
+        await session.execute(
+            select(AssetTransaction).where(
+                AssetTransaction.asset_id == asset.id,
+                AssetTransaction.source == connection.provider,
+            )
+        )
+    ).scalars().all()
+    by_external = {row.external_id: row for row in existing_rows if row.external_id}
+
+    for movement in movements:
+        movement_type = str(movement.get("type") or "").upper()
+        if movement_type == "BUY":
+            kind = "buy"
+        elif movement_type == "SELL":
+            kind = "sell"
+        else:
+            continue
+        external_id = movement.get("id")
+        quantity = movement.get("quantity")
+        price = movement.get("value")
+        raw_date = movement.get("tradeDate") or movement.get("date")
+        if not external_id or quantity is None or price is None or not raw_date:
+            continue
+        try:
+            movement_date = date.fromisoformat(str(raw_date)[:10])
+        except ValueError:
+            continue
+        quantity_dec = _decimal_or_zero(quantity)
+        price_dec = _decimal_or_zero(price)
+        if quantity_dec == 0:
+            continue
+        fee = abs(_decimal_or_zero(movement.get("expenses")))
+        row = by_external.get(str(external_id))
+        if row is None:
+            session.add(
+                AssetTransaction(
+                    asset_id=asset.id,
+                    workspace_id=asset.workspace_id,
+                    kind=kind,
+                    quantity=quantity_dec,
+                    price=price_dec,
+                    fee=fee,
+                    date=movement_date,
+                    source=connection.provider,
+                    external_id=str(external_id),
+                )
+            )
+        else:
+            row.kind = kind
+            row.quantity = quantity_dec
+            row.price = price_dec
+            row.fee = fee
+            row.date = movement_date
+    await session.flush()
+
+    # Keep the derived position (units / average price / cost basis) in step
+    # with the ledger — but only when the ledger accounts for the provider's
+    # quantity. A holding whose movements predate the provider's lookback
+    # would otherwise be truncated (units → 0) and dropped from the portfolio.
+    quantity = holding.quantity
+    if quantity is None or Decimal(str(quantity)) <= 0:
+        return
+    rows = (
+        await session.execute(
+            select(AssetTransaction.kind, AssetTransaction.quantity).where(
+                AssetTransaction.asset_id == asset.id
+            )
+        )
+    ).all()
+    ledger_units = sum(
+        (Decimal(str(q)) if k == "buy" else -Decimal(str(q))) for k, q in rows
+    )
+    tolerance = max(Decimal("0.000001"), Decimal(str(quantity)) * Decimal("0.01"))
+    if ledger_units > 0 and abs(ledger_units - Decimal(str(quantity))) <= tolerance:
+        from app.services import asset_transaction_service
+
+        await asset_transaction_service.recompute_and_cache(session, asset)
 
 
 async def _sync_holdings(
@@ -631,6 +749,11 @@ async def _sync_holdings(
             await _ensure_historical_seed(
                 session, asset, holding.purchase_date, holding.purchase_price
             )
+        # Import the holding's buy/sell movements into the asset ledger so the
+        # Assets → Transações view shows them (previously only manual rows).
+        await _sync_asset_movements(
+            session, connection, provider, credentials, asset, holding
+        )
         # Respect a user-set sell_date: if they've marked the asset as
         # sold we stop recording new values even when the provider still
         # reports the position. Historical values stay; current totals
@@ -672,6 +795,27 @@ async def _sync_holdings(
                 await session.delete(emptied)
 
 
+def _apply_holding_price(asset: Asset, holding) -> None:
+    """Cache the provider's per-unit price so the UI can show "Preço atual".
+
+    Synced holdings use manual valuation (the provider's balance is the value),
+    so no market-price refresh runs for them; without this the column stayed
+    empty even though the provider sends a unit price.
+    """
+    unit_price = holding.unit_price
+    if unit_price is None and holding.quantity and holding.current_value is not None:
+        try:
+            unit_price = Decimal(str(holding.current_value)) / Decimal(
+                str(holding.quantity)
+            )
+        except (InvalidOperation, ZeroDivisionError):
+            unit_price = None
+    if unit_price is None:
+        return
+    asset.last_price = Decimal(str(unit_price)).quantize(Decimal("0.000001"))
+    asset.last_price_at = datetime.now(timezone.utc)
+
+
 async def _upsert_asset_from_holding(
     session: AsyncSession,
     asset: Optional[Asset],
@@ -708,6 +852,7 @@ async def _upsert_asset_from_holding(
             external_metadata=holding.metadata,
             valuation_method="manual",
         )
+        _apply_holding_price(asset, holding)
         session.add(asset)
         await session.flush()
         return asset
@@ -747,6 +892,7 @@ async def _upsert_asset_from_holding(
         asset.ticker = holding.ticker
     if holding.maturity_date:
         asset.maturity_date = holding.maturity_date
+    _apply_holding_price(asset, holding)
     return asset
 
 

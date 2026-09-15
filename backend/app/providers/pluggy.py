@@ -663,6 +663,39 @@ class PluggyProvider(BankProvider):
 
         return holdings
 
+    async def get_investment_transactions(
+        self, credentials: dict, investment_external_id: str
+    ) -> list[dict]:
+        """Fetch an investment's movements (BUY/SELL/INTEREST/...) from Pluggy.
+
+        Pluggy keeps the movements on /investments/{id}/transactions — a
+        separate endpoint from /investments. Used to feed the asset ledger
+        (Assets → Transações).
+        """
+        headers = await self._headers()
+        movements: list[dict] = []
+        page = 1
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            while True:
+                resp = await client.get(
+                    f"{PLUGGY_API_BASE}/investments/{investment_external_id}/transactions",
+                    headers=headers,
+                    params={"pageSize": 500, "page": page},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+                results = data.get("results", [])
+                movements.extend(results)
+
+                total_pages = data.get("totalPages", 1)
+                if page >= total_pages or not results:
+                    break
+                page += 1
+
+        return movements
+
     async def get_bills(self, credentials: dict, account_external_id: str) -> list[BillData]:
         """Fetch credit-card bills from Pluggy /bills.
 
