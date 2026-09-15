@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-from sqlalchemy import delete, exists, func, or_, select, update
+from sqlalchemy import case, delete, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -1400,6 +1400,10 @@ async def handle_oauth_callback(
         )
         await reconciliation_service.match_incoming(session, workspace_id, landed)
 
+    # Position every card transaction on the invoice it is charged on
+    # (provider billId → billForecastDate → installment/bill date).
+    await _assign_connection_credit_card_bills(session, user_id, connection)
+
     # Investment holdings live on /investments — separate endpoint from
     # /accounts. Pulled after account setup when enabled so holdings are
     # available on the Assets page immediately after the widget closes.
@@ -1746,6 +1750,208 @@ async def _sync_bill_finance_charges(
             await session.delete(tx)
 
 
+# ─── Credit-card invoice positioning ────────────────────────────────────────
+# Pluggy never exposes the *open* invoice, and its installments carry the bill
+# they are charged on (creditCardMetadata.billForecastDate) or, for connectors
+# like Itaú, the bill's own due date in the transaction date. The app used to
+# bucket everything by a purchase-date cycle window, which pushed each month's
+# installments into the previous invoice. To match the bank app we link every
+# card transaction to the invoice it belongs to (creating a synthetic
+# "forecast" bill when the provider hasn't issued it yet) and stamp the bill's
+# due date as the effective date.
+
+_FORECAST_BILL_PREFIX = "forecast:"
+
+
+def _is_forecast_bill(bill: CreditCardBill) -> bool:
+    return (bill.external_id or "").startswith(_FORECAST_BILL_PREFIX)
+
+
+def _bill_due_on_next_business_day(year: int, month: int, day: int) -> date:
+    """Nominal due date, moved forward when it lands on a weekend.
+
+    Holidays aren't known here; when the provider eventually issues the real
+    bill its due date replaces this one.
+    """
+    import calendar as _calendar
+
+    last_day = _calendar.monthrange(year, month)[1]
+    due = date(year, month, min(day, last_day))
+    while due.weekday() >= 5:  # Saturday/Sunday
+        due += timedelta(days=1)
+    return due
+
+
+async def _find_or_create_forecast_bill(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    account: Account,
+    due_date: date,
+) -> CreditCardBill:
+    """Return the account's bill for that competency, minting a forecast row.
+
+    Prefers an already-synced (real) bill for the same year/month so a
+    forecast link is upgraded automatically once the bank statement lands.
+    """
+    existing = (
+        await session.execute(
+            select(CreditCardBill)
+            .where(
+                CreditCardBill.account_id == account.id,
+                func.extract("year", CreditCardBill.due_date) == due_date.year,
+                func.extract("month", CreditCardBill.due_date) == due_date.month,
+            )
+            .order_by(CreditCardBill.due_date)
+        )
+    ).scalars().all()
+    for bill in existing:
+        if not _is_forecast_bill(bill):
+            return bill
+    if existing:
+        return existing[0]
+    bill = CreditCardBill(
+        user_id=user_id,
+        workspace_id=account.workspace_id,
+        account_id=account.id,
+        external_id=(
+            f"{_FORECAST_BILL_PREFIX}{account.external_id}:"
+            f"{due_date.year}-{due_date.month:02d}"
+        ),
+        due_date=due_date,
+        total_amount=Decimal("0"),
+        currency=account.currency or "BRL",
+        raw_data={"synthetic": True, "source": "installment_forecast"},
+    )
+    session.add(bill)
+    await session.flush()
+    return bill
+
+
+async def _assign_connection_credit_card_bills(
+    session: AsyncSession, user_id: uuid.UUID, connection: BankConnection
+) -> None:
+    """Link every credit-card transaction to the invoice it is charged on.
+
+    Resolution order per transaction:
+      1. `creditCardMetadata.billId` → the synced (real) bill;
+      2. `creditCardMetadata.billForecastDate` (YYYY-MM) → the bill of that
+         competency, using the account's due day (business-day adjusted);
+      3. no forecast (e.g. Itaú): a pending installment whose date sits on the
+         account's due day is dated by the bill itself, so its own date is the
+         invoice's due date.
+    Existing manual overrides (`effective_bill_date`) are preserved.
+    """
+    accounts = (
+        await session.execute(
+            select(Account).where(
+                Account.connection_id == connection.id,
+                Account.type == "credit_card",
+            )
+        )
+    ).scalars().all()
+    for account in accounts:
+        if not account.payment_due_day:
+            continue
+        transactions = (
+            await session.execute(
+                select(Transaction).where(Transaction.account_id == account.id)
+            )
+        ).scalars().all()
+        for tx in transactions:
+            raw = tx.raw_data if isinstance(tx.raw_data, dict) else {}
+            meta = raw.get("creditCardMetadata")
+            if not isinstance(meta, dict):
+                meta = {}
+            bill_external = meta.get("billId")
+            forecast = meta.get("billForecastDate")
+            target = None
+            if bill_external:
+                target = await session.scalar(
+                    select(CreditCardBill).where(
+                        CreditCardBill.account_id == account.id,
+                        CreditCardBill.external_id == str(bill_external),
+                    )
+                )
+            elif isinstance(forecast, str) and re.match(r"^\d{4}-\d{2}$", forecast):
+                year, month = int(forecast[:4]), int(forecast[5:7])
+                explicit_due = None
+                if (
+                    tx.installment_number
+                    and tx.date.year == year
+                    and tx.date.month == month
+                    and abs(tx.date.day - account.payment_due_day) <= 5
+                ):
+                    explicit_due = tx.date
+                target = await _find_or_create_forecast_bill(
+                    session,
+                    user_id,
+                    account,
+                    explicit_due
+                    or _bill_due_on_next_business_day(
+                        year, month, account.payment_due_day
+                    ),
+                )
+            elif (
+                tx.status == "pending"
+                and tx.installment_number
+                and abs(tx.date.day - account.payment_due_day) <= 5
+            ):
+                target = await _find_or_create_forecast_bill(
+                    session, user_id, account, tx.date
+                )
+            if target is None:
+                continue
+            if tx.bill_id != target.id:
+                tx.bill_id = target.id
+            if tx.effective_bill_date is None:
+                tx.effective_bill_date = target.due_date
+                tx.effective_date = target.due_date
+        # Forecast bills have no provider total: derive it from their ledger.
+        bills = (
+            await session.execute(
+                select(CreditCardBill).where(CreditCardBill.account_id == account.id)
+            )
+        ).scalars().all()
+        for bill in bills:
+            if not _is_forecast_bill(bill):
+                continue
+            # Same exclusions the card summary applies (`counts_on_bill`):
+            # paired transfers and ignored rows stay out, and credits filed
+            # under a transfer-like category (bill payments) don't shrink the
+            # invoice — they settle an earlier one.
+            total = await session.scalar(
+                select(
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (Transaction.type == "debit", Transaction.amount),
+                                else_=-Transaction.amount,
+                            )
+                        ),
+                        0,
+                    )
+                )
+                .select_from(Transaction)
+                .outerjoin(Category, Transaction.category_id == Category.id)
+                .where(
+                    Transaction.bill_id == bill.id,
+                    Transaction.transfer_pair_id.is_(None),
+                    Transaction.is_ignored.is_(False),
+                    or_(
+                        Transaction.category_id.is_(None),
+                        Category.is_ignored.is_(False),
+                    ),
+                    or_(
+                        Transaction.type == "debit",
+                        Transaction.category_id.is_(None),
+                        Category.treat_as_transfer.is_(False),
+                    ),
+                )
+            )
+            bill.total_amount = Decimal(str(total or 0)).quantize(Decimal("0.01"))
+    await session.flush()
+
+
 async def _sync_credit_card_bills(
     session: AsyncSession,
     user_id: uuid.UUID,
@@ -1788,6 +1994,44 @@ async def _sync_credit_card_bills(
     for bd in bills_data:
         bill = by_external_id.get(bd.external_id)
         if bill is None:
+            # Adopt the synthetic forecast row for this competency so the
+            # transactions already linked to it keep their invoice and the
+            # real statement simply replaces the placeholder.
+            adopted = next(
+                (
+                    (key, candidate)
+                    for key, candidate in by_external_id.items()
+                    if _is_forecast_bill(candidate)
+                    and candidate.due_date.year == bd.due_date.year
+                    and candidate.due_date.month == bd.due_date.month
+                ),
+                None,
+            )
+            if adopted is not None:
+                old_key, bill = adopted
+                old_due = bill.due_date
+                by_external_id.pop(old_key, None)
+                bill.external_id = bd.external_id
+                bill.due_date = bd.due_date
+                bill.total_amount = bd.total_amount
+                bill.currency = bd.currency
+                bill.minimum_payment = bd.minimum_payment
+                bill.raw_data = bd.raw_data
+                by_external_id[bd.external_id] = bill
+                if old_due != bd.due_date:
+                    await session.execute(
+                        update(Transaction)
+                        .where(
+                            Transaction.bill_id == bill.id,
+                            Transaction.source == "sync",
+                            Transaction.effective_bill_date == old_due,
+                        )
+                        .values(
+                            effective_bill_date=bd.due_date,
+                            effective_date=bd.due_date,
+                        )
+                    )
+                continue
             bill = CreditCardBill(
                 user_id=user_id,
                 account_id=account.id,
@@ -1801,11 +2045,25 @@ async def _sync_credit_card_bills(
             session.add(bill)
             by_external_id[bd.external_id] = bill
         else:
+            old_due = bill.due_date
             bill.due_date = bd.due_date
             bill.total_amount = bd.total_amount
             bill.currency = bd.currency
             bill.minimum_payment = bd.minimum_payment
             bill.raw_data = bd.raw_data
+            if old_due != bd.due_date:
+                await session.execute(
+                    update(Transaction)
+                    .where(
+                        Transaction.bill_id == bill.id,
+                        Transaction.source == "sync",
+                        Transaction.effective_bill_date == old_due,
+                    )
+                    .values(
+                        effective_bill_date=bd.due_date,
+                        effective_date=bd.due_date,
+                    )
+                )
 
     await session.flush()
 
@@ -2301,6 +2559,10 @@ async def sync_connection(
             await reconciliation_service.match_incoming(
                 session, workspace_id, landed
             )
+
+        # Position every card transaction on the invoice it is charged on
+        # (provider billId → billForecastDate → installment/bill date).
+        await _assign_connection_credit_card_bills(session, user_id, connection)
 
         # Clean up phantom duplicates: providers occasionally double-report the
         # same payment with different ids. Once transfer detection has paired
