@@ -1280,21 +1280,19 @@ async def _account_balance_at(
             return current_bal
 
         status_filter = [] if include_pending else [Transaction.status == "posted"]
-        # Subtract activity after cutoff to get the balance AT cutoff
-        # Exclude ignored transactions from balance calculation
+        # Subtract activity after cutoff to get the balance AT cutoff.
+        # Category-level flags are a reporting preference and must not hide
+        # real cash flows here: dropping transfer-like rows (PIX between the
+        # user's own accounts, card payments) from the reconstruction turned
+        # past balances into fiction. Only the row-level ignore counts.
         delta_after = await session.scalar(
             select(func.coalesce(func.sum(_signed_balance_expr(account.currency)), 0))
-            .outerjoin(Category, Transaction.category_id == Category.id)
             .where(
                 Transaction.account_id == account.id,
                 Transaction.date > cutoff,
                 Transaction.date <= today,
                 Transaction.is_ignored == False,
                 *status_filter,
-                or_(
-                    Transaction.category_id.is_(None),
-                    Category.is_ignored == False,
-                ),
             )
         )
         historical = current_bal - float(delta_after or 0)
@@ -1304,16 +1302,11 @@ async def _account_balance_at(
             # intentionally left untouched to preserve provider parity.
             pending_delta = await session.scalar(
                 select(func.coalesce(func.sum(_signed_balance_expr(account.currency)), 0))
-                .outerjoin(Category, Transaction.category_id == Category.id)
                 .where(
                     Transaction.account_id == account.id,
                     Transaction.date <= today,
                     Transaction.status == "pending",
                     Transaction.is_ignored == False,
-                    or_(
-                        Transaction.category_id.is_(None),
-                        Category.is_ignored == False,
-                    ),
                 )
             )
             historical -= float(pending_delta or 0)
@@ -1368,21 +1361,27 @@ async def _total_balance_by_currency(
         else_=-effective,
     )
 
-    async def grouped_sums(account_ids: list[uuid.UUID], *filters) -> dict[uuid.UUID, float]:
+    async def grouped_sums(
+        account_ids: list[uuid.UUID],
+        *filters,
+        include_ignored_categories: bool = False,
+    ) -> dict[uuid.UUID, float]:
         if not account_ids:
             return {}
+        category_filter = [] if include_ignored_categories else [
+            or_(
+                Transaction.category_id.is_(None),
+                Category.is_ignored == False,
+            )
+        ]
         result = await session.execute(
             select(Transaction.account_id, func.coalesce(func.sum(signed), 0))
             .join(Account, Transaction.account_id == Account.id)
-            .outerjoin(Category, Transaction.category_id == Category.id)
             .where(
                 Transaction.account_id.in_(account_ids),
                 Transaction.is_ignored == False,
                 *filters,
-                or_(
-                    Transaction.category_id.is_(None),
-                    Category.is_ignored == False,
-                ),
+                *category_filter,
             )
             .group_by(Transaction.account_id)
         )
@@ -1403,12 +1402,14 @@ async def _total_balance_by_currency(
             Transaction.date > cutoff,
             Transaction.date <= today,
             *([] if include_pending else [Transaction.status == "posted"]),
+            include_ignored_categories=True,
         )
         if not include_pending:
             connected_pending = await grouped_sums(
                 connected_ids,
                 Transaction.date <= today,
                 Transaction.status == "pending",
+                include_ignored_categories=True,
             )
 
     totals: dict[str, float] = {}
@@ -1489,7 +1490,6 @@ async def _daily_balance_deltas_by_date(
             func.sum(signed),
         )
         .join(Account, Transaction.account_id == Account.id)
-        .outerjoin(Category, Transaction.category_id == Category.id)
         .where(
             Transaction.workspace_id == workspace_id,
             Account.is_closed == False,
@@ -1498,10 +1498,6 @@ async def _daily_balance_deltas_by_date(
             Transaction.date <= date.today(),
             Transaction.is_ignored == False,
             *status_filter,
-            or_(
-                Transaction.category_id.is_(None),
-                Category.is_ignored == False,
-            ),
             *( [Transaction.account_id.in_(account_ids)] if account_ids is not None else [] ),
         )
         .group_by(Transaction.date, Account.currency)
