@@ -1,3 +1,4 @@
+import calendar
 import hashlib
 import logging
 import re
@@ -1866,6 +1867,10 @@ def _shift_month(year: int, month: int, offset: int) -> tuple[int, int]:
     return year, month
 
 
+def _day_in_month(year: int, month: int, day: int) -> date:
+    return date(year, month, min(day, calendar.monthrange(year, month)[1]))
+
+
 def _installment_plan_key(tx: Transaction) -> Optional[tuple]:
     """Fingerprint tying a plan's installments together across months."""
     meta = _cc_metadata(tx)
@@ -1951,6 +1956,14 @@ async def _sync_projected_installments(
             due = _bill_due_on_next_business_day(
                 target[0], target[1], account.payment_due_day or 1
             )
+            # The installment keeps the plan's day-of-month, stepped from the
+            # installment we know: cash-mode views read one parcel per month
+            # instead of jumping to the invoice due date. The invoice itself
+            # still comes from billForecastDate.
+            charge_year, charge_month = _shift_month(
+                tx.date.year, tx.date.month, installment - number
+            )
+            charge_date = _day_in_month(charge_year, charge_month, tx.date.day)
             projection = Transaction(
                 user_id=tx.user_id,
                 workspace_id=tx.workspace_id,
@@ -1966,7 +1979,7 @@ async def _sync_projected_installments(
                 currency=tx.currency,
                 amount_primary=tx.amount_primary,
                 fx_rate_used=tx.fx_rate_used,
-                date=due,
+                date=charge_date,
                 effective_date=due,
                 type=tx.type,
                 source="sync",
