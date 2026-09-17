@@ -1279,6 +1279,25 @@ async def _account_balance_at(
         if cutoff >= today:
             return current_bal
 
+        # Coverage: an account with no movement before this cutoff had no
+        # balance then — a card opened last month had no debt a year ago.
+        # Extrapolating before the data invented retroactive debt.
+        first_movement = await session.scalar(
+            select(func.min(Transaction.date)).where(
+                Transaction.account_id == account.id,
+            )
+        )
+        if first_movement is not None and cutoff < first_movement:
+            return 0.0
+
+        # Investment accounts carry their value in the Assets ledger: their
+        # cash movements (portfolio buys, redemptions) are not the whole story
+        # and reconstructing cash from them went negative. Report the stated
+        # balance for every snapshot; the assets' own history carries the
+        # portfolio.
+        if account.type == "investment":
+            return current_bal
+
         status_filter = [] if include_pending else [Transaction.status == "posted"]
         # Subtract activity after cutoff to get the balance AT cutoff.
         # Category-level flags are a reporting preference and must not hide
@@ -1412,6 +1431,18 @@ async def _total_balance_by_currency(
                 include_ignored_categories=True,
             )
 
+    # Coverage per account (mirrors _account_balance_at): an account with no
+    # movement before the cutoff had no balance then, and an investment
+    # account's shelf is its stated balance at every snapshot.
+    first_movements: dict[uuid.UUID, date] = {}
+    if accounts:
+        coverage_rows = await session.execute(
+            select(Transaction.account_id, func.min(Transaction.date))
+            .where(Transaction.account_id.in_([account.id for account in accounts]))
+            .group_by(Transaction.account_id)
+        )
+        first_movements = {row[0]: row[1] for row in coverage_rows.all()}
+
     totals: dict[str, float] = {}
     for account in accounts:
         if account.connection_id:
@@ -1419,9 +1450,13 @@ async def _total_balance_by_currency(
             if account.type == "credit_card":
                 bal = -bal
             if cutoff < today:
-                bal -= connected_deltas.get(account.id, 0.0)
-                if not include_pending:
-                    bal -= connected_pending.get(account.id, 0.0)
+                first = first_movements.get(account.id)
+                if first is not None and cutoff < first:
+                    bal = 0.0
+                elif account.type != "investment":
+                    bal -= connected_deltas.get(account.id, 0.0)
+                    if not include_pending:
+                        bal -= connected_pending.get(account.id, 0.0)
         else:
             bal = manual_sums.get(account.id, 0.0)
         totals[account.currency] = totals.get(account.currency, 0) + bal
@@ -1493,6 +1528,10 @@ async def _daily_balance_deltas_by_date(
         .where(
             Transaction.workspace_id == workspace_id,
             Account.is_closed == False,
+            # Investment accounts keep a constant shelf in the balance history
+            # (their value lives in the Assets ledger), so their cash movements
+            # must not move the daily chart either.
+            Account.type != "investment",
             Transaction.date >= start,
             Transaction.date < end,
             Transaction.date <= date.today(),

@@ -1,10 +1,11 @@
 import asyncio
 import logging
 import time
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -102,6 +103,28 @@ def _decimal_or_none(value) -> Optional[Decimal]:
         return Decimal(str(value))
     except (ValueError, TypeError, InvalidOperation):
         return None
+
+
+# Providers report timestamps as UTC instants, but the bank's business date is
+# the local (São Paulo) date: an 23:59 BRT salary lands as 02:59Z the next day
+# and must not be pushed forward — that split same-day salary/payment pairs
+# across month boundaries and flipped past balances.
+_PROVIDER_TIMEZONE = ZoneInfo("America/Sao_Paulo")
+
+
+def _provider_local_date(value: object) -> Optional[date]:
+    """Map a provider timestamp to the local business date."""
+    raw = str(value or "")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            return date.fromisoformat(raw[:10])
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        return parsed.date()
+    return parsed.astimezone(_PROVIDER_TIMEZONE).date()
 
 
 def _date_or_none(value) -> Optional[date]:
@@ -443,7 +466,9 @@ class PluggyProvider(BankProvider):
                     else:
                         txn_type = "credit" if amount_raw >= 0 else "debit"
 
-                    txn_date = date.fromisoformat(txn["date"][:10])
+                    txn_date = _provider_local_date(txn.get("date"))
+                    if txn_date is None:
+                        continue
 
                     # Pending vs booked status
                     status = "pending" if txn.get("status") == "PENDING" else "posted"

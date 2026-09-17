@@ -499,12 +499,9 @@ async def sync_opening_balance_for_connected_account(
             Transaction.source != "opening_balance",
             Transaction.date <= balance_cutoff,
             Transaction.is_ignored == False,
-            or_(
-                Transaction.category_id.is_(None),
-                Transaction.category_id.not_in(
-                    select(Category.id).where(Category.is_ignored == True)
-                ),
-            ),
+            # Only the row-level ignore hides money from the reconciliation;
+            # category flags (transfer-like) are a reporting preference and
+            # excluding them here produced absurd synthetic openings.
         )
     )
     tx_sum = Decimal(str(sum_result.scalar() or 0))
@@ -531,12 +528,6 @@ async def sync_opening_balance_for_connected_account(
             Transaction.source != "opening_balance",
             Transaction.date <= balance_cutoff,
             Transaction.is_ignored == False,
-            or_(
-                Transaction.category_id.is_(None),
-                Transaction.category_id.not_in(
-                    select(Category.id).where(Category.is_ignored == True)
-                ),
-            ),
         )
     )
     oldest_date = oldest_result.scalar()
