@@ -75,7 +75,7 @@ x-backend-base: &backend-base
   # positioning fix (and the investment-movements sync). Pin it so a
   # `docker compose pull` can't drop the patch; override with
   # BACKEND_IMAGE_TAG=latest (or any other tag) when building fresh images.
-  image: ghcr.io/securo-finance/securo-backend:${BACKEND_IMAGE_TAG:-cardbills}
+  image: ghcr.io/securo-finance/securo-backend:${BACKEND_IMAGE_TAG:-minha-branch}
   environment: *backend-env
   # Lets a connection point at a model server running on the host (LM Studio,
   # Ollama, llama.cpp) as http://host.docker.internal:<port>. Docker Desktop
@@ -130,7 +130,7 @@ services:
     # `cardbills` is the locally built frontend carrying the bill-timeline
     # strip fix (it anchors on the current cycle instead of the last six
     # bills). Override with FRONTEND_IMAGE_TAG=latest to go back.
-    image: ghcr.io/securo-finance/securo-frontend:${FRONTEND_IMAGE_TAG:-cardbills}
+    image: ghcr.io/securo-finance/securo-frontend:${FRONTEND_IMAGE_TAG:-minha-branch}
     ports:
       - "${FRONTEND_PORT:-3000}:8080"
     environment:
