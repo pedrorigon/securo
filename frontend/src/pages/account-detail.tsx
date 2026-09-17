@@ -463,7 +463,22 @@ export default function AccountDetailPage() {
       if (account.statement_close_day) {
         cycles.push(creditCardCycleBoundaries(account.statement_close_day, new Date()))
       }
-      return cycles.slice(isMobile ? -4 : -6)
+      // Window the strip around the current invoice instead of blindly taking
+      // the last N cycles: with future invoices present (installment
+      // projections) "the last N" drifts into next year and pushes the open
+      // cycle out of the strip. Anchor on the first bill due today or later,
+      // and keep the trailing in-progress bar only when no bill covers the
+      // current cycle (i.e. when every bill is in the past).
+      const windowSize = isMobile ? 4 : 6
+      const today = format(new Date(), 'yyyy-MM-dd')
+      const upcomingIndex = cycles.findIndex(c => c.bill && c.bill.due_date >= today)
+      if (upcomingIndex === -1) {
+        return cycles.slice(Math.max(0, cycles.length - windowSize))
+      }
+      return cycles.slice(
+        Math.max(0, upcomingIndex - 2),
+        Math.min(cycles.length, upcomingIndex + windowSize - 2),
+      )
     }
 
     if (!account.statement_close_day) return []
@@ -1007,13 +1022,29 @@ export default function AccountDetailPage() {
               onClick={() => {
                 setFilterTouched(false)
                 if (account?.type === 'credit_card') {
-                  const { start, end } = defaultCycleForCreditCard(
-                    account.statement_close_day,
-                    account.payment_due_day,
-                    new Date(),
-                  )
-                  setFilterFrom(start)
-                  setFilterTo(end)
+                  // Anchor on the current open invoice (first bill due today
+                  // or later), exactly like the initial load does. The raw
+                  // cycle-math range doesn't match any bill, which flips the
+                  // view into unbilled-only mode and hides the billed rows.
+                  const today = format(new Date(), 'yyyy-MM-dd')
+                  const upcomingIndex = billsAsc.findIndex(b => b.due_date >= today)
+                  const upcoming = billsAsc[upcomingIndex]
+                  if (upcoming) {
+                    const { start, end } = rangeForBill(
+                      upcoming,
+                      upcomingIndex > 0 ? billsAsc[upcomingIndex - 1] : null,
+                    )
+                    setFilterFrom(start)
+                    setFilterTo(end)
+                  } else {
+                    const { start, end } = defaultCycleForCreditCard(
+                      account.statement_close_day,
+                      account.payment_due_day,
+                      new Date(),
+                    )
+                    setFilterFrom(start)
+                    setFilterTo(end)
+                  }
                 } else {
                   setFilterFrom(defaultFrom())
                   setFilterTo(defaultTo())
@@ -1287,12 +1318,17 @@ export default function AccountDetailPage() {
 
       {isCreditCard && (() => {
         const limit = account.credit_limit != null ? Number(account.credit_limit) : null
-        // Cycle-bound utilization: how much of the limit was charged in the cycle
-        // currently being viewed. For the current cycle this matches the "current
-        // open balance" since nothing has been paid yet; for past cycles it shows
-        // that month's burn rate against the (current) limit.
+        // Real utilization: how much of the limit the card actually consumed
+        // right now (open invoice + installments still to be billed), which is
+        // limit minus the available credit the provider reports. Falls back to
+        // the viewed cycle's total when the provider doesn't report available
+        // credit (manual cards).
         const cycleBillTotal = (showPrimary ? summary?.projected_expenses_primary : undefined) ?? summary?.projected_expenses ?? summary?.monthly_expenses ?? 0
-        const utilized = limit != null ? cycleBillTotal : null
+        const utilized = limit != null
+          ? account.available_credit != null
+            ? Math.max(0, limit - Number(account.available_credit))
+            : cycleBillTotal
+          : null
         const rawPct = limit != null && limit > 0 && utilized != null ? (utilized / limit) * 100 : null
         const pct = rawPct != null ? Math.min(100, rawPct) : null
         return (
