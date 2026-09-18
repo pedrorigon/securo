@@ -66,13 +66,16 @@ export default function BudgetsPage() {
   const [monthCalOpen, setMonthCalOpen] = useState(false)
   const dateFnsLocale = resolveDateFnsLocale(i18n.resolvedLanguage ?? i18n.language)
   const monthParam = `${selectedMonth}-01`
+  // Always starts as categories, on every visit — group budgets are a view
+  // somebody switches to, not a mode the screen stays in.
+  const [scope, setScope] = useState<'category' | 'group'>('category')
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editing, setEditing] = useState<Budget | null>(null)
   const [deletingBudget, setDeletingBudget] = useState<Budget | null>(null)
 
   const { data: budgetsList } = useQuery({
-    queryKey: ['budgets', selectedMonth],
-    queryFn: () => budgetsApi.list(monthParam),
+    queryKey: ['budgets', selectedMonth, scope],
+    queryFn: () => budgetsApi.list(monthParam, scope),
   })
 
   const { data: categoriesList } = useQuery({
@@ -93,7 +96,7 @@ export default function BudgetsPage() {
   })
 
   const createMutation = useMutation({
-    mutationFn: (data: { category_id: string; amount: number; month: string; is_recurring?: boolean }) =>
+    mutationFn: (data: { category_id?: string; group_id?: string; amount: number; month: string; is_recurring?: boolean }) =>
       budgetsApi.create(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['budgets'] })
@@ -136,6 +139,17 @@ export default function BudgetsPage() {
       <span className="flex items-center gap-2">
         <CategoryIcon icon={category.icon} color={category.color} size="sm" />
         <span>{category.name}</span>
+      </span>
+    )
+  }
+
+  const getGroupDisplay = (groupId: string) => {
+    const group = groupsList?.find((candidate) => candidate.id === groupId)
+    if (!group) return <span>{groupId}</span>
+    return (
+      <span className="flex items-center gap-2">
+        <CategoryIcon icon={group.icon} color={group.color} size="sm" />
+        <span>{group.name}</span>
       </span>
     )
   }
@@ -196,18 +210,36 @@ export default function BudgetsPage() {
         <SectionHeader
           title={t('budgets.title')}
           action={
-            canWrite ? (
-              <Button size="sm" className="gap-1.5 h-8" onClick={() => { setEditing(null); setDialogOpen(true) }}>
-                <Plus size={13} /> {t('budgets.add')}
-              </Button>
-            ) : undefined
+            <div className="flex items-center gap-2">
+              <div className="inline-flex rounded-lg border border-border bg-muted/40 p-0.5">
+                <button
+                  onClick={() => setScope('category')}
+                  className={`px-2 py-0.5 rounded-md text-xs font-medium transition-colors cursor-pointer ${scope === 'category' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+                >
+                  {t('dashboard.groupByCategory')}
+                </button>
+                <button
+                  onClick={() => setScope('group')}
+                  className={`px-2 py-0.5 rounded-md text-xs font-medium transition-colors cursor-pointer ${scope === 'group' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+                >
+                  {t('dashboard.groupByGroup')}
+                </button>
+              </div>
+              {canWrite && (
+                <Button size="sm" className="gap-1.5 h-8" onClick={() => { setEditing(null); setDialogOpen(true) }}>
+                  <Plus size={13} /> {t('budgets.add')}
+                </Button>
+              )}
+            </div>
           }
         />
         {budgetsList && budgetsList.length > 0 ? (
           <table className="w-full">
             <thead>
               <tr className="border-b border-border">
-                <th className={`${TH} pl-4 sm:pl-5 text-left`}>{t('budgets.category')}</th>
+                <th className={`${TH} pl-4 sm:pl-5 text-left`}>
+                  {scope === 'category' ? t('budgets.category') : t('budgets.group')}
+                </th>
                 <th className={`${TH} text-left w-36`}>{t('budgets.amount')}</th>
                 {canWrite && <th className={`${TH} pr-4 sm:pr-5 text-right w-24`}>{t('budgets.actions')}</th>}
               </tr>
@@ -217,7 +249,9 @@ export default function BudgetsPage() {
                 <tr key={budget.id} className="border-b border-border last:border-0 hover:bg-muted transition-colors">
                   <td className="py-3 pl-4 sm:pl-5 text-sm font-medium text-foreground">
                     <span className="flex items-center gap-1.5">
-                      {getCategoryDisplay(budget.category_id)}
+                      {scope === 'category'
+                        ? getCategoryDisplay(budget.category_id ?? '')
+                        : getGroupDisplay(budget.group_id ?? '')}
                       {budget.is_recurring && (
                         <span title={t('budgets.recurringLabel')} className="text-muted-foreground">
                           <Repeat size={12} />
@@ -275,38 +309,64 @@ export default function BudgetsPage() {
                 })
               } else {
                 const isRecurring = formData.get('is_recurring') === 'on'
-                createMutation.mutate({
-                  category_id: formData.get('category_id') as string,
-                  amount: parseFloat(formData.get('amount') as string),
-                  month: monthParam,
-                  is_recurring: isRecurring,
-                })
+                const amount = parseFloat(formData.get('amount') as string)
+                createMutation.mutate(
+                  scope === 'group'
+                    ? {
+                        group_id: formData.get('group_id') as string,
+                        amount,
+                        month: monthParam,
+                        is_recurring: isRecurring,
+                      }
+                    : {
+                        category_id: formData.get('category_id') as string,
+                        amount,
+                        month: monthParam,
+                        is_recurring: isRecurring,
+                      },
+                )
               }
             }}
             className="space-y-4"
           >
             {!editing && (
               <>
-                <div className="space-y-2">
-                  <Label>{t('budgets.category')}</Label>
-                  <select
-                    name="category_id"
-                    className="w-full border border-border rounded-lg px-3 py-2 text-sm bg-card text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
-                    required
-                  >
-                    <option value="">{t('budgets.selectCategory')}</option>
-                    {groupsList?.map((group) => (
-                      <optgroup key={group.id} label={group.name}>
-                        {group.categories.map((cat) => (
-                          <option key={cat.id} value={cat.id}>{cat.name}</option>
-                        ))}
-                      </optgroup>
-                    ))}
-                    {categoriesList?.filter((c) => !c.group_id).map((cat) => (
-                      <option key={cat.id} value={cat.id}>{cat.name}</option>
-                    ))}
-                  </select>
-                </div>
+                {scope === 'group' ? (
+                  <div className="space-y-2">
+                    <Label>{t('budgets.group')}</Label>
+                    <select
+                      name="group_id"
+                      className="w-full border border-border rounded-lg px-3 py-2 text-sm bg-card text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                      required
+                    >
+                      <option value="">{t('budgets.selectGroup')}</option>
+                      {groupsList?.map((group) => (
+                        <option key={group.id} value={group.id}>{group.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <Label>{t('budgets.category')}</Label>
+                    <select
+                      name="category_id"
+                      className="w-full border border-border rounded-lg px-3 py-2 text-sm bg-card text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                      required
+                    >
+                      <option value="">{t('budgets.selectCategory')}</option>
+                      {groupsList?.map((group) => (
+                        <optgroup key={group.id} label={group.name}>
+                          {group.categories.map((cat) => (
+                            <option key={cat.id} value={cat.id}>{cat.name}</option>
+                          ))}
+                        </optgroup>
+                      ))}
+                      {categoriesList?.filter((c) => !c.group_id).map((cat) => (
+                        <option key={cat.id} value={cat.id}>{cat.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input type="checkbox" name="is_recurring" className="rounded border-border" />
                   <span className="text-sm text-foreground">{t('budgets.repeatEveryMonth')}</span>
@@ -343,8 +403,11 @@ export default function BudgetsPage() {
             ? 'budgets.confirmDeleteRecurringDescription'
             : 'budgets.confirmDeleteDescription',
           {
-            name: findCategoryReference(displayCategories, deletingBudget?.category_id ?? '')?.name
-              ?? t('budgets.category'),
+            name: deletingBudget?.category_id
+              ? findCategoryReference(displayCategories, deletingBudget.category_id)?.name
+                ?? t('budgets.category')
+              : groupsList?.find((group) => group.id === deletingBudget?.group_id)?.name
+                ?? t('budgets.group'),
           },
         )}
         isPending={deleteMutation.isPending}

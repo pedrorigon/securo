@@ -311,3 +311,64 @@ async def test_delete_recurring_previous_takes_effect(client, auth_headers, test
     cat_budgets2 = [b for b in list_resp2.json() if b["category_id"] == str(cat.id)]
     assert len(cat_budgets2) == 1
     assert float(cat_budgets2[0]["amount"]) == 100.0
+
+
+@pytest.mark.asyncio
+async def test_group_budgets_api(client, auth_headers, test_categories):
+    """A budget is for a category or a group; the scope picks the list, and
+    the two never mix."""
+    group_resp = await client.post(
+        "/api/category-groups",
+        json={"name": "Moradia", "icon": "house", "color": "#8b5cf6"},
+        headers=auth_headers,
+    )
+    assert group_resp.status_code == 201
+    group_id = group_resp.json()["id"]
+
+    group_budget = await client.post(
+        "/api/budgets",
+        json={"group_id": group_id, "amount": 2000.0, "month": _current_month_str()},
+        headers=auth_headers,
+    )
+    assert group_budget.status_code == 201
+    assert group_budget.json()["group_id"] == group_id
+    assert group_budget.json()["category_id"] is None
+
+    await client.post(
+        "/api/budgets",
+        json={"category_id": str(test_categories[0].id), "amount": 500.0, "month": _current_month_str()},
+        headers=auth_headers,
+    )
+
+    group_list = await client.get(
+        f"/api/budgets?month={_current_month_str()}&scope=group", headers=auth_headers
+    )
+    assert [b["group_id"] for b in group_list.json()] == [group_id]
+    assert all(b["category_id"] is None for b in group_list.json())
+
+    category_list = await client.get(
+        f"/api/budgets?month={_current_month_str()}&scope=category", headers=auth_headers
+    )
+    assert all(b["category_id"] is not None for b in category_list.json())
+    assert group_id not in {b.get("group_id") for b in category_list.json()}
+
+    both = await client.post(
+        "/api/budgets",
+        json={
+            "group_id": group_id,
+            "category_id": str(test_categories[0].id),
+            "amount": 1.0,
+            "month": _current_month_str(),
+        },
+        headers=auth_headers,
+    )
+    assert both.status_code == 422
+
+    comparison = await client.get(
+        f"/api/budgets/comparison?month={_current_month_str()}&scope=group",
+        headers=auth_headers,
+    )
+    assert comparison.status_code == 200
+    row = next((r for r in comparison.json() if r.get("group_id") == group_id), None)
+    if row is not None:
+        assert float(row["budget_amount"]) == 2000.0

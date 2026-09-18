@@ -20,10 +20,11 @@ router = APIRouter(prefix="/api/budgets", tags=["budgets"])
 @router.get("", response_model=list[BudgetRead])
 async def list_budgets(
     month: Optional[date] = Query(None),
+    scope: str = Query("category", pattern="^(category|group)$"),
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
-    return await budget_service.get_budgets(session, ctx.workspace.id, month)
+    return await budget_service.get_budgets(session, ctx.workspace.id, month, scope)
 
 
 @router.post("", response_model=BudgetRead, status_code=status.HTTP_201_CREATED)
@@ -65,7 +66,10 @@ async def delete_budget(
 @router.get("/comparison", response_model=list[BudgetVsActual])
 async def budget_comparison(
     month: Optional[date] = Query(None),
+    scope: str = Query("category", pattern="^(category|group)$"),
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
-    return await budget_service.get_budget_vs_actual(session, ctx.workspace.id, ctx.user_id, month)
+    return await budget_service.get_budget_vs_actual(
+        session, ctx.workspace.id, ctx.user_id, month, scope
+    )

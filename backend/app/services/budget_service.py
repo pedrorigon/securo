@@ -32,30 +32,46 @@ def _primary_amount_expr():
     return func.coalesce(Transaction.amount_primary, Transaction.amount)
 
 
+def _scope_column(scope: str):
+    """The column a budget is keyed by: category or group."""
+    if scope == "group":
+        return Budget.group_id
+    if scope != "category":
+        raise ValueError("scope must be category or group")
+    return Budget.category_id
+
+
 async def _build_budget_map(
-    session: AsyncSession, workspace_id: uuid.UUID, month_start: date
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    month_start: date,
+    scope: str = "category",
 ) -> dict[str, tuple[Decimal, bool]]:
-    """Build a map of category_id -> (amount, is_recurring) for the given month.
+    """Build a map of scope-key -> (amount, is_recurring) for the given month.
 
     Resolution order:
     1. Month-specific override (is_recurring=false, month=M) takes priority
     2. Most recent recurring default (is_recurring=true, month<=M) as fallback
+
+    The same rules serve both scopes; only the key changes (a category or a
+    group). Rows of the other scope are excluded explicitly: NULL keys would
+    otherwise collapse every group budget under one "None" entry.
     """
+    key = _scope_column(scope)
     budget_map: dict[str, tuple[Decimal, bool]] = {}
 
-    # Query 1: Get effective recurring defaults (most recent per category where month <= M)
-    # Use a subquery to get the max month per category for recurring budgets
     max_month_subq = (
         select(
-            Budget.category_id,
+            key.label("scope_key"),
             func.max(Budget.month).label("max_month"),
         )
         .where(
             Budget.workspace_id == workspace_id,
+            key.isnot(None),
             Budget.is_recurring == True,  # noqa: E712
             Budget.month <= month_start,
         )
-        .group_by(Budget.category_id)
+        .group_by(key)
         .subquery()
     )
 
@@ -64,37 +80,44 @@ async def _build_budget_map(
         .join(
             max_month_subq,
             and_(
-                Budget.category_id == max_month_subq.c.category_id,
+                key == max_month_subq.c.scope_key,
                 Budget.month == max_month_subq.c.max_month,
             ),
         )
         .where(
             Budget.workspace_id == workspace_id,
+            key.isnot(None),
             Budget.is_recurring == True,  # noqa: E712
         )
     )
     for b in recurring_result.scalars().all():
-        budget_map[str(b.category_id)] = (b.amount, True)
+        budget_map[str(getattr(b, "group_id" if scope == "group" else "category_id"))] = (b.amount, True)
 
-    # Query 2: Month-specific overrides (take priority over recurring)
     overrides_result = await session.execute(
         select(Budget).where(
             Budget.workspace_id == workspace_id,
+            key.isnot(None),
             Budget.is_recurring == False,  # noqa: E712
             Budget.month == month_start,
         )
     )
     for b in overrides_result.scalars().all():
-        budget_map[str(b.category_id)] = (b.amount, False)
+        budget_map[str(getattr(b, "group_id" if scope == "group" else "category_id"))] = (b.amount, False)
 
     return budget_map
 
 
 async def get_budgets(
-    session: AsyncSession, workspace_id: uuid.UUID, month: Optional[date] = None
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    month: Optional[date] = None,
+    scope: str = "category",
 ) -> list[Budget]:
+    key = _scope_column(scope)
     if not month:
-        query = select(Budget).where(Budget.workspace_id == workspace_id)
+        query = select(Budget).where(
+            Budget.workspace_id == workspace_id, key.isnot(None)
+        )
         result = await session.execute(query.order_by(Budget.month.desc()))
         return list(result.scalars().all())
 
@@ -104,25 +127,30 @@ async def get_budgets(
     overrides_result = await session.execute(
         select(Budget).where(
             Budget.workspace_id == workspace_id,
+            key.isnot(None),
             Budget.is_recurring == False,  # noqa: E712
             Budget.month == month_start,
         )
     )
     overrides = list(overrides_result.scalars().all())
-    override_category_ids = {str(b.category_id) for b in overrides}
+    override_keys = {
+        str(getattr(b, "group_id" if scope == "group" else "category_id"))
+        for b in overrides
+    }
 
     # Get effective recurring defaults for this month
     max_month_subq = (
         select(
-            Budget.category_id,
+            key.label("scope_key"),
             func.max(Budget.month).label("max_month"),
         )
         .where(
             Budget.workspace_id == workspace_id,
+            key.isnot(None),
             Budget.is_recurring == True,  # noqa: E712
             Budget.month <= month_start,
         )
-        .group_by(Budget.category_id)
+        .group_by(key)
         .subquery()
     )
 
@@ -131,18 +159,20 @@ async def get_budgets(
         .join(
             max_month_subq,
             and_(
-                Budget.category_id == max_month_subq.c.category_id,
+                key == max_month_subq.c.scope_key,
                 Budget.month == max_month_subq.c.max_month,
             ),
         )
         .where(
             Budget.workspace_id == workspace_id,
+            key.isnot(None),
             Budget.is_recurring == True,  # noqa: E712
         )
     )
     recurring = [
         b for b in recurring_result.scalars().all()
-        if str(b.category_id) not in override_category_ids
+        if str(getattr(b, "group_id" if scope == "group" else "category_id"))
+        not in override_keys
     ]
 
     return sorted(overrides + recurring, key=lambda b: b.month, reverse=True)
@@ -163,10 +193,32 @@ async def create_budget(
     user_id: uuid.UUID,
     data: BudgetCreate,
 ) -> Budget:
+    if (data.category_id is None) == (data.group_id is None):
+        raise ValueError("A budget is for a category or for a group, not both")
+    if data.category_id is not None:
+        exists = await session.scalar(
+            select(Category.id).where(
+                Category.id == data.category_id,
+                Category.workspace_id == workspace_id,
+            )
+        )
+        if exists is None:
+            raise ValueError("Unknown category")
+    else:
+        exists = await session.scalar(
+            select(CategoryGroup.id).where(
+                CategoryGroup.id == data.group_id,
+                CategoryGroup.workspace_id == workspace_id,
+            )
+        )
+        if exists is None:
+            raise ValueError("Unknown category group")
+
     budget = Budget(
         user_id=user_id,
         workspace_id=workspace_id,
         category_id=data.category_id,
+        group_id=data.group_id,
         amount=data.amount,
         month=data.month.replace(day=1),
         is_recurring=data.is_recurring,
@@ -192,6 +244,7 @@ async def update_budget(
                 user_id=budget.user_id,
                 workspace_id=budget.workspace_id,
                 category_id=budget.category_id,
+                group_id=budget.group_id,
                 amount=data.amount if data.amount is not None else budget.amount,
                 month=effective,
                 is_recurring=True,
@@ -227,6 +280,7 @@ async def get_budget_vs_actual(
     workspace_id: uuid.UUID,
     user_id: uuid.UUID,
     month: Optional[date] = None,
+    scope: str = "category",
 ) -> list[BudgetVsActual]:
     if not month:
         month = date.today().replace(day=1)
@@ -256,7 +310,9 @@ async def get_budget_vs_actual(
         return []
 
     # Get budgets for this month (with recurring resolution)
-    budget_map = await _build_budget_map(session, workspace_id, month_start)
+    budget_map = await _build_budget_map(
+        session, workspace_id, month_start, scope="category"
+    )
 
     # Get user's primary currency for FX conversion + reporting mode
     user = await session.get(User, user_id)
@@ -431,6 +487,8 @@ async def get_budget_vs_actual(
             )
         projected_prev_spending_map[cat_id] = projected_prev_spending_map.get(cat_id, Decimal("0")) + converted
 
+    group_meta: dict[str, tuple[str, str, str]] = {}
+
     comparisons = []
     for category, group in all_categories:
         cat_id = str(category.id)
@@ -441,6 +499,9 @@ async def get_budget_vs_actual(
         budget_entry = budget_map.get(cat_id)
         budget_amount = budget_entry[0] if budget_entry else None
         is_recurring = budget_entry[1] if budget_entry else False
+
+        if group:
+            group_meta[str(group.id)] = (group.name, group.icon, group.color)
 
         # Skip categories with no spending in either month and no budget
         if actual == 0 and projected == 0 and prev_actual == 0 and projected_prev == 0 and budget_amount is None:
@@ -466,4 +527,83 @@ async def get_budget_vs_actual(
             is_recurring=is_recurring,
         ))
 
+    if scope == "group":
+        group_budgets = await _build_budget_map(
+            session, workspace_id, month_start, scope="group"
+        )
+        return _aggregate_by_group(comparisons, group_meta, group_budgets)
+
     return sorted(comparisons, key=lambda x: float(x.actual_amount), reverse=True)
+
+
+def _aggregate_by_group(
+    rows: list[BudgetVsActual],
+    group_meta: dict[str, tuple[str, str, str]],
+    group_budgets: dict[str, tuple[Decimal, bool]],
+) -> list[BudgetVsActual]:
+    """Fold the per-category comparison into one row per group.
+
+    `budget_amount` is the group's own budget when it has one, and null
+    otherwise: the caller decides whether a group without a budget should
+    borrow the sum of its category budgets (the home's group view does, so
+    nothing disappears the day this ships). Everything else — the month's
+    spending, the forecast and both previous-month references — is the sum
+    of the group's categories, which is exactly what the group view shows.
+    """
+    buckets: dict[str, dict] = {}
+    for row in rows:
+        key = str(row.group_id) if row.group_id else "__none__"
+        bucket = buckets.setdefault(
+            key,
+            {
+                "group_id": row.group_id,
+                "actual": Decimal("0"),
+                "projected": Decimal("0"),
+                "prev": Decimal("0"),
+                "projected_prev": Decimal("0"),
+            },
+        )
+        bucket["actual"] += row.actual_amount
+        bucket["projected"] += row.projected_amount
+        bucket["prev"] += row.prev_month_amount
+        bucket["projected_prev"] += row.projected_prev_month_amount
+
+    out: list[BudgetVsActual] = []
+    for key, bucket in buckets.items():
+        name = icon = color = None
+        if bucket["group_id"] is not None:
+            name, icon, color = group_meta.get(key, (None, None, None))
+        budget_entry = group_budgets.get(key)
+        budget_amount = budget_entry[0] if budget_entry else None
+        is_recurring = budget_entry[1] if budget_entry else False
+
+        if (
+            bucket["actual"] == 0
+            and bucket["projected"] == 0
+            and bucket["prev"] == 0
+            and bucket["projected_prev"] == 0
+            and budget_amount is None
+        ):
+            continue
+
+        percentage = None
+        if budget_amount and budget_amount > 0:
+            percentage = round(float(bucket["projected"] / budget_amount * 100), 1)
+
+        out.append(BudgetVsActual(
+            category_id=None,
+            category_name=name or "",
+            category_icon=icon or "folder",
+            category_color=color or "#6B7280",
+            group_id=bucket["group_id"],
+            group_name=name,
+            budget_amount=budget_amount,
+            actual_amount=bucket["actual"],
+            projected_amount=bucket["projected"],
+            prev_month_amount=bucket["prev"],
+            projected_prev_month_amount=bucket["projected_prev"],
+            percentage_used=percentage,
+            is_recurring=is_recurring,
+        ))
+
+    return sorted(out, key=lambda x: float(x.actual_amount), reverse=True)

@@ -3,14 +3,22 @@ from datetime import date as _Date
 from decimal import Decimal
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class BudgetCreate(BaseModel):
-    category_id: uuid.UUID
+    #: Exactly one of the two: a budget measures a category or a group.
+    category_id: Optional[uuid.UUID] = None
+    group_id: Optional[uuid.UUID] = None
     amount: Decimal
     month: _Date  # First day of month
     is_recurring: bool = False
+
+    @model_validator(mode="after")
+    def _one_scope(self) -> "BudgetCreate":
+        if (self.category_id is None) == (self.group_id is None):
+            raise ValueError("A budget is for a category or for a group, not both")
+        return self
 
 
 class BudgetUpdate(BaseModel):
@@ -21,7 +29,8 @@ class BudgetUpdate(BaseModel):
 class BudgetRead(BaseModel):
     id: uuid.UUID
     user_id: uuid.UUID
-    category_id: uuid.UUID
+    category_id: Optional[uuid.UUID] = None
+    group_id: Optional[uuid.UUID] = None
     amount: Decimal
     month: _Date
     is_recurring: bool
@@ -30,7 +39,8 @@ class BudgetRead(BaseModel):
 
 
 class BudgetVsActual(BaseModel):
-    category_id: uuid.UUID
+    #: Null on a group row: the fields below describe the group instead.
+    category_id: Optional[uuid.UUID] = None
     category_name: str
     category_icon: str
     category_color: str

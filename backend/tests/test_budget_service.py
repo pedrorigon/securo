@@ -434,3 +434,190 @@ async def test_budget_vs_actual_includes_prev_month(
     cat0 = [c for c in comparisons if c.category_id == test_categories[0].id]
     if cat0:
         assert cat0[0].prev_month_amount == Decimal("75")
+
+
+# ---------------------------------------------------------------------------
+# Group budgets
+# ---------------------------------------------------------------------------
+
+
+async def _make_group(session, test_user, test_workspace, name="Moradia"):
+    group = CategoryGroup(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        name=name,
+        icon="house",
+        color="#8b5cf6",
+    )
+    session.add(group)
+    await session.commit()
+    await session.refresh(group)
+    return group
+
+
+@pytest.mark.asyncio
+async def test_create_group_budget_and_list_by_scope(
+    session: AsyncSession, test_user, test_workspace, test_categories
+):
+    group = await _make_group(session, test_user, test_workspace)
+    group_budget = await create_budget(
+        session,
+        test_workspace.id,
+        test_user.id,
+        BudgetCreate(group_id=group.id, amount=Decimal("2000.00"), month=date(2025, 3, 1)),
+    )
+    await create_budget(
+        session,
+        test_workspace.id,
+        test_user.id,
+        BudgetCreate(category_id=test_categories[0].id, amount=Decimal("500.00"), month=date(2025, 3, 1)),
+    )
+
+    group_rows = await get_budgets(session, test_workspace.id, date(2025, 3, 1), scope="group")
+    assert [b.id for b in group_rows] == [group_budget.id]
+    assert group_rows[0].group_id == group.id
+    assert group_rows[0].category_id is None
+
+    category_rows = await get_budgets(session, test_workspace.id, date(2025, 3, 1), scope="category")
+    assert all(b.category_id is not None for b in category_rows)
+    assert group_budget.id not in {b.id for b in category_rows}
+
+
+@pytest.mark.asyncio
+async def test_group_budget_recurring_and_override_resolution(
+    session: AsyncSession, test_user, test_workspace
+):
+    group = await _make_group(session, test_user, test_workspace)
+    await create_budget(
+        session, test_workspace.id, test_user.id,
+        BudgetCreate(group_id=group.id, amount=Decimal("1000.00"), month=date(2025, 1, 1), is_recurring=True),
+    )
+    await create_budget(
+        session, test_workspace.id, test_user.id,
+        BudgetCreate(group_id=group.id, amount=Decimal("1500.00"), month=date(2025, 3, 1)),
+    )
+
+    # March has a month-specific override.
+    march = await get_budgets(session, test_workspace.id, date(2025, 3, 1), scope="group")
+    assert len(march) == 1
+    assert march[0].amount == Decimal("1500.00")
+    assert march[0].is_recurring is False
+
+    # April falls back to the recurring default.
+    april = await get_budgets(session, test_workspace.id, date(2025, 4, 1), scope="group")
+    assert len(april) == 1
+    assert april[0].amount == Decimal("1000.00")
+    assert april[0].is_recurring is True
+
+
+@pytest.mark.asyncio
+async def test_budget_scope_validation(session: AsyncSession, test_user, test_workspace, test_categories):
+    group = await _make_group(session, test_user, test_workspace)
+    with pytest.raises(Exception):
+        BudgetCreate(category_id=test_categories[0].id, group_id=group.id, amount=Decimal("1"), month=date(2025, 3, 1))
+    with pytest.raises(Exception):
+        BudgetCreate(amount=Decimal("1"), month=date(2025, 3, 1))
+    with pytest.raises(ValueError):
+        await create_budget(
+            session, test_workspace.id, test_user.id,
+            BudgetCreate(group_id=uuid.uuid4(), amount=Decimal("1"), month=date(2025, 3, 1)),
+        )
+
+
+@pytest.mark.asyncio
+async def test_group_comparison_sums_categories_and_uses_group_budget(
+    session: AsyncSession, test_user, test_workspace, test_categories
+):
+    group = await _make_group(session, test_user, test_workspace)
+    for category in test_categories[:2]:
+        category.group_id = group.id
+    await session.commit()
+
+    account = Account(
+        id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+        name="GroupCmp", type="checking", balance=Decimal("5000"), currency="BRL",
+    )
+    session.add(account)
+    await session.commit()
+    session.add_all([
+        Transaction(
+            id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+            account_id=account.id, category_id=test_categories[0].id,
+            description="Rent", amount=Decimal("700"), date=date(2025, 3, 5),
+            type="debit", source="manual", created_at=datetime.now(timezone.utc),
+        ),
+        Transaction(
+            id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+            account_id=account.id, category_id=test_categories[1].id,
+            description="Power", amount=Decimal("300"), date=date(2025, 3, 6),
+            type="debit", source="manual", created_at=datetime.now(timezone.utc),
+        ),
+    ])
+    await session.commit()
+
+    # With a group budget of its own.
+    await create_budget(
+        session, test_workspace.id, test_user.id,
+        BudgetCreate(group_id=group.id, amount=Decimal("500.00"), month=date(2025, 3, 1)),
+    )
+    group_rows = await get_budget_vs_actual(
+        session, test_workspace.id, test_user.id, month=date(2025, 3, 1), scope="group"
+    )
+    row = next(r for r in group_rows if r.group_id == group.id)
+    assert row.category_id is None
+    assert row.actual_amount == Decimal("1000")
+    assert row.budget_amount == Decimal("500.00")
+    assert row.percentage_used == pytest.approx(200.0)
+
+    # The category view never sees the group's budget.
+    category_rows = await get_budget_vs_actual(
+        session, test_workspace.id, test_user.id, month=date(2025, 3, 1), scope="category"
+    )
+    assert all(r.category_id is not None for r in category_rows)
+    rent = next(r for r in category_rows if r.category_id == test_categories[0].id)
+    assert rent.budget_amount is None
+
+
+@pytest.mark.asyncio
+async def test_group_comparison_without_group_budget_leaves_it_null(
+    session: AsyncSession, test_user, test_workspace, test_categories
+):
+    """The backend reports the group's own budget only; the caller (the home)
+    decides whether to fall back to summing the category budgets."""
+    group = await _make_group(session, test_user, test_workspace)
+    for category in test_categories[:2]:
+        category.group_id = group.id
+    await session.commit()
+    account = Account(
+        id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+        name="NoGroupBudget", type="checking", balance=Decimal("5000"), currency="BRL",
+    )
+    session.add(account)
+    await session.commit()
+    session.add(Transaction(
+        id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+        account_id=account.id, category_id=test_categories[0].id,
+        description="Spend", amount=Decimal("80"), date=date(2025, 3, 5),
+        type="debit", source="manual", created_at=datetime.now(timezone.utc),
+    ))
+    await session.commit()
+    await create_budget(
+        session, test_workspace.id, test_user.id,
+        BudgetCreate(category_id=test_categories[0].id, amount=Decimal("250.00"), month=date(2025, 3, 1)),
+    )
+
+    group_rows = await get_budget_vs_actual(
+        session, test_workspace.id, test_user.id, month=date(2025, 3, 1), scope="group"
+    )
+    row = next(r for r in group_rows if r.group_id == group.id)
+    assert row.actual_amount == Decimal("80")
+    # The category budget is the caller's fallback, not the group's budget.
+    assert row.budget_amount is None
+    assert row.percentage_used is None
+
+    category_rows = await get_budget_vs_actual(
+        session, test_workspace.id, test_user.id, month=date(2025, 3, 1), scope="category"
+    )
+    rent = next(r for r in category_rows if r.category_id == test_categories[0].id)
+    assert rent.budget_amount == Decimal("250.00")
