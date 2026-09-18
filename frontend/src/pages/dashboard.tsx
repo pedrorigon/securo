@@ -42,6 +42,11 @@ import { CheckCircle2, CalendarIcon, Clock, Paperclip, Target, ArrowUpDown, Help
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { ICON_MAP } from '@/lib/category-icons'
 import { PageHeader } from '@/components/page-header'
+import { aggregateSpendingByGroup } from '@/lib/spending-by-group'
+import type { GroupBudgetOverride } from '@/lib/spending-by-group'
+import { readSpendingGroupBy, writeSpendingGroupBy } from '@/lib/spending-group-preference'
+import { spendingForecast } from '@/lib/spending-forecast'
+import type { SpendingGroupBy } from '@/lib/spending-group-preference'
 import { CategoryIcon } from '@/components/category-icon'
 import { AccountIcon } from '@/components/account-icon'
 import { TransactionDrillDown, type DrillDownFilter } from '@/components/transaction-drill-down'
@@ -427,18 +432,51 @@ export default function DashboardPage() {
   const projectedIncome = Number(summary?.projected_income_primary ?? summary?.projected_income ?? income)
   const projectedExpenses = Number(summary?.projected_expenses_primary ?? summary?.projected_expenses ?? expenses)
   const savingsRate = income > 0 ? ((income - expenses) / income) * 100 : 0
-  const isCurrentMonth = selectedMonth === currentMonth()
-  const daysElapsed = isCurrentMonth ? new Date().getDate() : monthLastDay(selectedMonth)
-  const daysInMonth = monthLastDay(selectedMonth)
-  const projectedSpend = expenses > 0 && isCurrentMonth && daysElapsed > 0
-    ? (expenses / daysElapsed) * daysInMonth
-    : null
+  const isPastMonth = selectedMonth < currentMonth()
+  // What the month is expected to close at: settled so far plus every
+  // pending and planned entry. Shown for the running month only — past
+  // months have a closing number, not a forecast.
+  const forecast = spendingForecast(
+    Number(summary?.projected_income_primary ?? summary?.projected_income ?? 0),
+    Number(summary?.projected_expenses_primary ?? summary?.projected_expenses ?? 0),
+  )
 
   // Uncategorized data
   const uncategorizedCount = summary?.pending_categorization ?? 0
   const uncategorizedAmount = summary?.pending_categorization_amount ?? 0
 
   const [catSortDesc, setCatSortDesc] = useState(true)
+  // Remembered across visits: somebody who thinks in groups should land in
+  // groups, not re-answer the same question every time they come home.
+  const [spendingGroupBy, setSpendingGroupBy] = useState<SpendingGroupBy>(readSpendingGroupBy)
+  const changeSpendingGroupBy = (value: SpendingGroupBy) => {
+    setSpendingGroupBy(value)
+    writeSpendingGroupBy(value)
+  }
+
+  // Group-scope comparison only when the group view is on: it carries the
+  // budgets somebody set for a group itself (the category-scope payload
+  // below keeps feeding the category view, untouched).
+  const { data: groupBudgetComparison } = useQuery({
+    queryKey: ['budgets', 'comparison', selectedMonth, 'group'],
+    queryFn: () => budgets.comparison(monthParam, 'group'),
+    enabled: spendingGroupBy === 'group',
+  })
+
+  const groupBudgetOverrides = useMemo(() => {
+    const map = new Map<string, GroupBudgetOverride>()
+    for (const row of groupBudgetComparison ?? []) {
+      if (!row.group_id || row.budget_amount == null) continue
+      map.set(row.group_id, {
+        budget_amount: Number(row.budget_amount),
+        prev:
+          row.projected_prev_month_amount != null
+            ? Number(row.projected_prev_month_amount)
+            : null,
+      })
+    }
+    return map
+  }, [groupBudgetComparison])
 
   // Merged category bars data
   const mergedCategories = useMemo(() => {
@@ -446,6 +484,7 @@ export default function DashboardPage() {
     const budgetMap = new Map<string, (typeof budgetComparison extends (infer T)[] | undefined ? T : never)>()
     if (budgetComparison) {
       for (const b of budgetComparison) {
+        if (b.category_id === null) continue
         budgetMap.set(b.category_id, b)
       }
     }
@@ -479,6 +518,96 @@ export default function DashboardPage() {
       })
       .sort((a, b) => catSortDesc ? b.actual - a.actual : a.actual - b.actual)
   }, [spending, budgetComparison, catSortDesc])
+
+  const categoryIdsByGroup = useMemo(() => {
+    const map = new Map<string, string[]>()
+    for (const category of categoriesList ?? []) {
+      if (!category.group_id) continue
+      const list = map.get(category.group_id) ?? []
+      list.push(category.id)
+      map.set(category.group_id, list)
+    }
+    return map
+  }, [categoriesList])
+
+  const groupRows = useMemo(
+    () =>
+      aggregateSpendingByGroup(
+        spending ?? [],
+        budgetComparison,
+        catSortDesc,
+        categoryIdsByGroup,
+        groupBudgetOverrides,
+      ),
+    [spending, budgetComparison, catSortDesc, categoryIdsByGroup, groupBudgetOverrides],
+  )
+
+  type SpendingRowView = {
+    key: string
+    name: string
+    icon: string
+    color: string
+    actual: number
+    budget_amount: number | null
+    percentage_used: number | null
+    momPct: number | null
+    open: () => void
+  }
+
+  const spendingRows = useMemo((): SpendingRowView[] => {
+    if (spendingGroupBy === 'category') {
+      return mergedCategories.map((item) => ({
+        key: item.category_id,
+        name: item.category_name,
+        icon: item.category_icon,
+        color: item.category_color,
+        actual: item.actual,
+        budget_amount: item.budget_amount,
+        percentage_used: item.percentage_used,
+        momPct: item.momPct,
+        open: () =>
+          setDrillDown({
+            title: t('dashboard.drillDownCategory', {
+              category: item.category_name,
+              month: monthLabelStr,
+            }),
+            category_id: item.category_id,
+            type: 'debit',
+            from: monthStart,
+            to: monthEnd,
+          }),
+      }))
+    }
+    return groupRows.map((row) => ({
+      key: row.group_id ?? '__none__',
+      name: row.group_name ?? t('dashboard.noGroup'),
+      icon: row.group_icon ?? 'folder',
+      color: row.group_color ?? '#6B7280',
+      actual: row.actual,
+      budget_amount: row.budget_amount,
+      percentage_used: row.percentage_used,
+      momPct: row.momPct,
+      open: () =>
+        setDrillDown({
+          title: t('dashboard.drillDownGroup', {
+            group: row.group_name ?? t('dashboard.noGroup'),
+            month: monthLabelStr,
+          }),
+          category_ids: row.category_ids,
+          type: 'debit',
+          from: monthStart,
+          to: monthEnd,
+        }),
+    }))
+  }, [
+    spendingGroupBy,
+    mergedCategories,
+    groupRows,
+    t,
+    monthLabelStr,
+    monthStart,
+    monthEnd,
+  ])
 
   const [txPage, setTxPage] = useState(1)
   const [txSortDesc, setTxSortDesc] = useState(true)
@@ -854,10 +983,40 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* Spending projection */}
-        {projectedSpend !== null && !summaryLoading && (
+        {/* Closing forecast: the running and future months have one; a month
+            already consolidated has a result instead, and stays quiet. */}
+        {forecast !== null && !isPastMonth && !summaryLoading && (
           <p className="text-xs text-muted-foreground mt-3">
-            {t('dashboard.spendingProjection', { amount: mask(formatCurrency(projectedSpend, primaryCurrency, locale)) })}
+            {t('dashboard.forecastIntro')}{' '}
+            {t('dashboard.forecastReceivedLabel')}{' '}
+            <span className="font-medium text-emerald-600">
+              {mask(formatCurrency(forecast.received, primaryCurrency, locale))}
+            </span>{' '}
+            {t('dashboard.forecastAnd')}{' '}
+            {t('dashboard.forecastSpentLabel')}{' '}
+            <span className="font-medium text-rose-500">
+              {mask(formatCurrency(forecast.spent, primaryCurrency, locale))}
+            </span>
+            {t('dashboard.forecastResulting')}{' '}
+            {t('dashboard.forecastBalanceLabel')}{' '}
+            <span
+              className={`font-medium ${forecast.balance >= 0 ? 'text-emerald-600' : 'text-rose-500'}`}
+            >
+              {mask(formatCurrency(forecast.balance, primaryCurrency, locale))}
+            </span>
+            {forecast.savingsRate !== null && (
+              <>
+                {' '}
+                {t('dashboard.forecastRateConnector')}{' '}
+                {t('dashboard.forecastRateLabel')}{' '}
+                <span
+                  className={`font-medium ${forecast.savingsRate >= 0 ? 'text-emerald-600' : 'text-rose-500'}`}
+                >
+                  {forecast.savingsRate.toFixed(0)}%
+                </span>
+              </>
+            )}
+            .
           </p>
         )}
       </div>
@@ -904,11 +1063,27 @@ export default function DashboardPage() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 mb-5" style={{ gridAutoRows: 'minmax(380px, auto)' }}>
         {/* Category Spending Bars */}
         <div className="bg-card rounded-xl border border-border shadow-sm flex flex-col max-h-[420px]">
-          <div className="px-5 py-4 border-b border-border shrink-0 flex items-center justify-between">
-            <p className="text-sm font-semibold text-foreground">{t('dashboard.spendingByCategory')}</p>
+          <div className="px-5 py-4 border-b border-border shrink-0 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <p className="text-sm font-semibold text-foreground whitespace-nowrap">{t('dashboard.spendingBy')}</p>
+              <div className="inline-flex rounded-lg border border-border bg-muted/40 p-0.5">
+                <button
+                  onClick={() => changeSpendingGroupBy('category')}
+                  className={`px-2 py-0.5 rounded-md text-xs font-medium transition-colors cursor-pointer ${spendingGroupBy === 'category' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+                >
+                  {t('dashboard.groupByCategory')}
+                </button>
+                <button
+                  onClick={() => changeSpendingGroupBy('group')}
+                  className={`px-2 py-0.5 rounded-md text-xs font-medium transition-colors cursor-pointer ${spendingGroupBy === 'group' ? 'bg-card text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+                >
+                  {t('dashboard.groupByGroup')}
+                </button>
+              </div>
+            </div>
             <button
               onClick={() => setCatSortDesc(v => !v)}
-              className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+              className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer shrink-0"
             >
               <ArrowUpDown size={13} />
               {catSortDesc ? t('dashboard.sortHighest') : t('dashboard.sortLowest')}
@@ -921,9 +1096,9 @@ export default function DashboardPage() {
                   <Skeleton key={i} className="h-12 w-full" />
                 ))}
               </div>
-            ) : mergedCategories.length > 0 ? (
+            ) : spendingRows.length > 0 ? (
               <div className="space-y-1.5">
-                {mergedCategories.map((item) => {
+                {spendingRows.map((item) => {
                   const hasBudget = item.budget_amount != null && item.budget_amount > 0
                   const pct = item.percentage_used
                   const barColor = hasBudget
@@ -932,21 +1107,15 @@ export default function DashboardPage() {
 
                   return (
                     <div
-                      key={item.category_id}
+                      key={item.key}
                       className="rounded-lg px-3 py-2.5 hover:bg-muted/50 transition-colors cursor-pointer"
-                      onClick={() => setDrillDown({
-                        title: t('dashboard.drillDownCategory', { category: item.category_name, month: monthLabelStr }),
-                        category_id: item.category_id,
-                        type: 'debit',
-                        from: monthStart,
-                        to: monthEnd,
-                      })}
+                      onClick={item.open}
                     >
                       <div className="flex items-center gap-3">
-                        <CategoryIcon icon={item.category_icon} color={item.category_color} size="lg" />
+                        <CategoryIcon icon={item.icon} color={item.color} size="lg" />
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center justify-between gap-2 mb-1">
-                            <span className="text-sm font-semibold text-foreground truncate">{item.category_name}</span>
+                            <span className="text-sm font-semibold text-foreground truncate">{item.name}</span>
                             <div className="flex items-center gap-2 shrink-0">
                               <span className="text-sm font-bold tabular-nums text-foreground">{mask(formatCurrency(item.actual, userCurrency, locale))}</span>
                               {item.momPct !== null && (
