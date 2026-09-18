@@ -609,6 +609,13 @@ export interface RecurringTransaction {
   fx_rate_used: number | null
 }
 
+/**
+ * Where an expected occurrence stands. `overdue`: one business day past the
+ * expected date and the month still open. `missed`: the month ended without
+ * the charge — listed only in the drill-down, never in a total.
+ */
+export type RecurringProjectionState = 'forecast' | 'overdue' | 'missed'
+
 export interface ProjectedTransaction {
   recurring_id: string
   account_id: string | null
@@ -622,6 +629,42 @@ export interface ProjectedTransaction {
   category_name: string | null
   category_icon: string | null
   category_color: string | null
+  state: RecurringProjectionState
+}
+
+/**
+ * A workspace-authored identification rule for recurring bills: the text that
+ * identifies the charge, and the bills it answers for. Amount and currency
+ * are deliberately absent — a subscription billed in dollars posts in reais.
+ */
+export interface RecurringMatchRule {
+  id: string
+  name: string
+  patterns: string[]
+  excludes: string[]
+  recurring_ids: string[]
+  created_at?: string | null
+  /** Set when this rule borrows a Rules-screen rule instead of own texts. */
+  source_rule_id?: string | null
+  source_rule_name?: string | null
+  /** Where the settling charge lands, when not the bill's own account/direction. */
+  search_account_id?: string | null
+  search_type?: 'debit' | 'credit' | null
+  /** Settle in pieces: the month's matching charges are summed. */
+  accumulate?: boolean
+  accumulate_threshold?: number | null
+}
+
+export interface RecurringMatchRuleInput {
+  name?: string
+  patterns?: string[]
+  excludes?: string[]
+  recurring_ids?: string[]
+  source_rule_id?: string | null
+  search_account_id?: string | null
+  search_type?: string | null
+  accumulate?: boolean
+  accumulate_threshold?: string | null
 }
 
 export interface TransactionCalendarItem {
@@ -711,6 +754,10 @@ export interface SpendingByCategory {
   total: number
   projected_total: number
   percentage: number
+  group_id: string | null
+  group_name: string | null
+  group_icon: string | null
+  group_color: string | null
 }
 
 export interface MonthlyTrend {
@@ -732,14 +779,16 @@ export interface BalanceHistory {
 export interface Budget {
   id: string
   user_id: string
-  category_id: string
+  /** Exactly one of category_id / group_id is set. */
+  category_id: string | null
+  group_id: string | null
   amount: number
   month: string
   is_recurring: boolean
 }
 
 export interface BudgetVsActual {
-  category_id: string
+  category_id: string | null
   category_name: string
   category_icon: string
   category_color: string

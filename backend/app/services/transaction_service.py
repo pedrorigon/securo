@@ -4,7 +4,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Optional, cast
 
-from sqlalchemy import CursorResult, delete, select, func, or_, not_, update
+from sqlalchemy import CursorResult, and_, delete, select, func, or_, not_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -130,6 +130,7 @@ async def get_transactions(
     include_summary: bool = False,
     user_pnl_only: bool = False,
     exclude_ignored: bool = False,
+    include_missed: bool = False,
 ) -> tuple[list[Transaction], int, Optional[dict]]:
     """List transactions for a workspace.
 
@@ -269,6 +270,20 @@ async def get_transactions(
         # filtered set, so the totals a hidden list shows stay the totals of
         # what it is showing.
         base_query = base_query.where(is_not_ignored())
+    if not include_missed:
+        # A generated placeholder whose month ended without a charge is a
+        # forecast that never happened. It survives in the ledger so the
+        # drill-down can show it (marked), but it does not belong in the
+        # transactions list, in exports or in anything that totals rows.
+        base_query = base_query.where(
+            not_(
+                and_(
+                    Transaction.source == "recurring",
+                    Transaction.external_id.is_(None),
+                    Transaction.date < date.today().replace(day=1),
+                )
+            )
+        )
     if txn_type:
         base_query = base_query.where(Transaction.type == txn_type)
     if status:

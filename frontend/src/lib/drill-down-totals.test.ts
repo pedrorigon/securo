@@ -66,6 +66,7 @@ describe('sumDrillDownTotals', () => {
       postedTotal: 0,
       pendingTotal: 0,
       projectedTotal: 0,
+      missedTotal: 0,
     })
   })
 
@@ -82,6 +83,36 @@ describe('sumDrillDownTotals', () => {
       postedTotal: 0,
       pendingTotal: 0,
       projectedTotal: 0,
+      missedTotal: 0,
     })
+  })
+
+  it('keeps a missed occurrence out of every total, reported on its own', () => {
+    // A month that ended without the charge is not money that moved. The
+    // panel lists it so it can be read and dismissed; the footer must not
+    // count it, and must say what it left out.
+    const totals = sumDrillDownTotals([
+      row({ amount: 200 }),
+      row({ amount: 20, isProjected: true }),
+      row({ amount: 375, isProjected: true, isMissed: true }),
+    ], 'USD')
+
+    expect(totals.absTotal).toBeCloseTo(220)
+    expect(totals.postedTotal).toBeCloseTo(200)
+    expect(totals.projectedTotal).toBeCloseTo(20)
+    expect(totals.missedTotal).toBeCloseTo(375)
+    expect(totals.postedTotal + totals.pendingTotal + totals.projectedTotal)
+      .toBeCloseTo(totals.absTotal)
+  })
+
+  it('a materialized missing placeholder is missed too', () => {
+    const totals = sumDrillDownTotals([
+      row({ amount: 57.84, isPending: true, isMissed: true }),
+      row({ amount: 10, isPending: true }),
+    ], 'USD')
+
+    expect(totals.pendingTotal).toBeCloseTo(10)
+    expect(totals.missedTotal).toBeCloseTo(57.84)
+    expect(totals.absTotal).toBeCloseTo(10)
   })
 })

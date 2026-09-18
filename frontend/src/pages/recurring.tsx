@@ -3,7 +3,7 @@ import { getAccountName, sortAccountsByDisplayName } from '@/lib/account-utils'
 import { useTranslation } from 'react-i18next'
 import { useDisplayLocale, useDateLocale } from '@/hooks/use-display-locale'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { categories as categoriesApi, categoryGroups as categoryGroupsApi, recurring as recurringApi, accounts as accountsApi, currencies as currenciesApi } from '@/lib/api'
+import { categories as categoriesApi, categoryGroups as categoryGroupsApi, recurring as recurringApi, accounts as accountsApi, currencies as currenciesApi, rules as rulesApi } from '@/lib/api'
 import { extractApiError } from '@/lib/api-errors'
 import { localDateString } from '@/lib/date-utils'
 import { invalidateFinancialQueries } from '@/lib/invalidate-queries'
@@ -19,8 +19,8 @@ import {
   DialogTitle,
   DialogFooter,
 } from '@/components/ui/dialog'
-import type { Category, CategoryGroup, RecurringTransaction } from '@/types'
-import { Pencil, Trash2, Plus, RefreshCw, Info } from 'lucide-react'
+import type { Category, CategoryGroup, RecurringMatchRule, RecurringTransaction, Rule } from '@/types'
+import { Pencil, Trash2, Plus, RefreshCw, Info, ListFilter } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { PageHeader } from '@/components/page-header'
 import { CategorySelect } from '@/components/category-select'
@@ -31,6 +31,26 @@ import { useWorkspace } from '@/contexts/workspace-context'
 import { formatCurrency } from '@/lib/format'
 
 const TH = 'text-xs font-medium text-muted-foreground py-3'
+
+/**
+ * What the recurring form decided about its identification rule. Kept as a
+ * value the form hands back alongside the recurring, because the association
+ * lives on the rule side (one rule can answer for several bills).
+ */
+type RuleChoice =
+  | { type: 'none' }
+  | { type: 'existing'; ruleId: string }
+  | { type: 'import'; sourceRuleId: string }
+  | {
+      type: 'new'
+      name: string
+      patterns: string[]
+      excludes: string[]
+      searchAccountId?: string
+      searchType?: string
+      accumulate?: boolean
+      accumulateThreshold?: string
+    }
 
 function SectionCard({ children }: { children: React.ReactNode }) {
   return (
@@ -72,11 +92,29 @@ function RecurringTab() {
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editing, setEditing] = useState<RecurringTransaction | null>(null)
   const [deletingRecurring, setDeletingRecurring] = useState<RecurringTransaction | null>(null)
+  const [rulesOpen, setRulesOpen] = useState(false)
 
   const { data: recurringList } = useQuery({
     queryKey: ['recurring'],
     queryFn: recurringApi.list,
   })
+
+  const { data: matchRules } = useQuery({
+    queryKey: ['recurring', 'match-rules'],
+    queryFn: recurringApi.matchRules.list,
+  })
+
+  const rulesByRecurring = useMemo(() => {
+    const index = new Map<string, RecurringMatchRule[]>()
+    for (const rule of matchRules ?? []) {
+      for (const recurringId of rule.recurring_ids) {
+        const list = index.get(recurringId) ?? []
+        list.push(rule)
+        index.set(recurringId, list)
+      }
+    }
+    return index
+  }, [matchRules])
 
   const { data: categoriesList } = useQuery({
     queryKey: ['categories'],
@@ -99,26 +137,117 @@ function RecurringTab() {
     queryFn: () => accountsApi.list(),
   })
 
+  // The Rules screen's own rules: reused as identification by choosing one
+  // in the recurring form, so the same sentence never has to be written twice.
+  const { data: normalRules } = useQuery({
+    queryKey: ['rules'],
+    queryFn: rulesApi.list,
+  })
+
+  const applyRuleChoice = async (recurringId: string, choice: RuleChoice) => {
+    const current = matchRules ?? []
+    const attached = current.filter((rule) => rule.recurring_ids.includes(recurringId))
+
+    const detachFromOthers = async (keepIds: Set<string>) => {
+      for (const rule of attached) {
+        if (keepIds.has(rule.id)) continue
+        await recurringApi.matchRules.update(rule.id, {
+          recurring_ids: rule.recurring_ids.filter((id) => id !== recurringId),
+        })
+      }
+    }
+    const attachTo = async (rule: RecurringMatchRule) => {
+      if (!rule.recurring_ids.includes(recurringId)) {
+        await recurringApi.matchRules.update(rule.id, {
+          recurring_ids: [...rule.recurring_ids, recurringId],
+        })
+      }
+    }
+
+    if (choice.type === 'none') {
+      await detachFromOthers(new Set())
+      return
+    }
+    if (choice.type === 'existing') {
+      const rule = current.find((candidate) => candidate.id === choice.ruleId)
+      if (rule) await attachTo(rule)
+      await detachFromOthers(new Set(rule ? [rule.id] : []))
+      return
+    }
+    if (choice.type === 'import') {
+      const existing = current.find(
+        (candidate) => candidate.source_rule_id === choice.sourceRuleId,
+      )
+      if (existing) {
+        await attachTo(existing)
+        await detachFromOthers(new Set([existing.id]))
+      } else {
+        await recurringApi.matchRules.create({
+          source_rule_id: choice.sourceRuleId,
+          recurring_ids: [recurringId],
+        })
+        await detachFromOthers(new Set())
+      }
+      return
+    }
+    await recurringApi.matchRules.create({
+      name: choice.name,
+      patterns: choice.patterns,
+      excludes: choice.excludes,
+      recurring_ids: [recurringId],
+      search_account_id: choice.searchAccountId || null,
+      search_type: choice.searchType || null,
+      accumulate: choice.accumulate ?? false,
+      accumulate_threshold: choice.accumulateThreshold || null,
+    })
+    await detachFromOthers(new Set())
+  }
+
+  const refreshAfterRuleChange = () => {
+    queryClient.invalidateQueries({ queryKey: ['recurring', 'match-rules'] })
+    queryClient.invalidateQueries({ queryKey: ['recurring'] })
+    invalidateFinancialQueries(queryClient)
+  }
+
   const createMutation = useMutation({
-    mutationFn: (data: Partial<RecurringTransaction>) => recurringApi.create(data),
-    onSuccess: () => {
+    mutationFn: ({ data }: { data: Partial<RecurringTransaction>; ruleChoice: RuleChoice }) =>
+      recurringApi.create(data),
+    onSuccess: async (created, variables) => {
       invalidateFinancialQueries(queryClient)
       queryClient.invalidateQueries({ queryKey: ['recurring'] })
       setDialogOpen(false)
       toast.success(t('recurring.created'))
+      try {
+        await applyRuleChoice(created.id, variables.ruleChoice)
+        refreshAfterRuleChange()
+      } catch {
+        toast.error(t('common.error'))
+      }
     },
     onError: () => toast.error(t('common.error')),
   })
 
   const updateMutation = useMutation({
-    mutationFn: ({ id, ...data }: Partial<RecurringTransaction> & { id: string }) =>
-      recurringApi.update(id, data),
-    onSuccess: () => {
+    mutationFn: ({
+      id,
+      data,
+    }: {
+      id: string
+      data: Partial<RecurringTransaction>
+      ruleChoice: RuleChoice
+    }) => recurringApi.update(id, data),
+    onSuccess: async (_updated, variables) => {
       invalidateFinancialQueries(queryClient)
       queryClient.invalidateQueries({ queryKey: ['recurring'] })
       setDialogOpen(false)
       setEditing(null)
       toast.success(t('recurring.updated'))
+      try {
+        await applyRuleChoice(variables.id, variables.ruleChoice)
+        refreshAfterRuleChange()
+      } catch {
+        toast.error(t('common.error'))
+      }
     },
     onError: () => toast.error(t('common.error')),
   })
@@ -170,6 +299,15 @@ function RecurringTab() {
                   variant="outline"
                   size="sm"
                   className="gap-1.5 h-8"
+                  onClick={() => setRulesOpen(true)}
+                >
+                  <ListFilter size={12} />
+                  <span>{t('recurring.rules')}</span>
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-1.5 h-8"
                   onClick={() => generateMutation.mutate()}
                   disabled={generateMutation.isPending}
                 >
@@ -198,7 +336,25 @@ function RecurringTab() {
             <tbody>
               {recurringList.map((rt) => (
                 <tr key={rt.id} className="border-b border-border last:border-0 hover:bg-muted transition-colors">
-                  <td className="py-3 pl-4 sm:pl-5 text-sm font-medium text-foreground">{rt.description}</td>
+                  <td className="py-3 pl-4 sm:pl-5 text-sm font-medium text-foreground">
+                    {rt.description}
+                    {(rulesByRecurring.get(rt.id) ?? []).length > 0 && (
+                      <div className="flex flex-wrap gap-1 mt-1">
+                        {(rulesByRecurring.get(rt.id) ?? []).map((rule) => (
+                          <button
+                            key={rule.id}
+                            type="button"
+                            onClick={() => setRulesOpen(true)}
+                            title={t('recurring.rules')}
+                            className="inline-flex items-center gap-1 rounded-full border border-violet-200 bg-violet-50 px-1.5 py-0.5 text-[10px] font-medium text-violet-700 hover:bg-violet-100 transition-colors dark:border-violet-900 dark:bg-violet-950/40 dark:text-violet-300 dark:hover:bg-violet-900/60"
+                          >
+                            <ListFilter size={9} />
+                            {rule.name}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </td>
                   <td className={`py-3 text-xs sm:text-sm font-bold tabular-nums ${rt.type === 'credit' ? 'text-emerald-600' : 'text-rose-500'}`}>
                     {mask(`${rt.type === 'credit' ? '+' : '−'}${formatCurrency(rt.amount, rt.currency, locale)}`)}
                     {rt.currency !== userCurrency && rt.amount_primary != null && (
@@ -274,11 +430,13 @@ function RecurringTab() {
               (category) => category.id === editing?.category_id
             )}
             accounts={accountsList ?? []}
-            onSave={(data) => {
+            matchRules={matchRules ?? []}
+            normalRules={normalRules ?? []}
+            onSave={(data, ruleChoice) => {
               if (editing) {
-                updateMutation.mutate({ id: editing.id, ...data })
+                updateMutation.mutate({ id: editing.id, data, ruleChoice })
               } else {
-                createMutation.mutate(data)
+                createMutation.mutate({ data, ruleChoice })
               }
             }}
             onCancel={() => { setDialogOpen(false); setEditing(null) }}
@@ -295,6 +453,444 @@ function RecurringTab() {
         onClose={() => setDeletingRecurring(null)}
         onConfirm={() => deletingRecurring && deleteMutation.mutate(deletingRecurring.id)}
       />
+
+      <MatchRulesDialog
+        open={rulesOpen}
+        onClose={() => setRulesOpen(false)}
+        rules={matchRules ?? []}
+        recurringList={recurringList ?? []}
+        accounts={accountsList ?? []}
+        canWrite={canWrite}
+      />
+    </>
+  )
+}
+
+/**
+ * The sentence a person writes when the bank's wording never matches the
+ * bill's: patterns that identify the charge, terms to exclude, and the bills
+ * the rule answers for. Amounts are deliberately absent — a subscription
+ * billed in dollars posts in reais with IOF on top.
+ */
+function MatchRulesDialog({
+  open,
+  onClose,
+  rules,
+  recurringList,
+  accounts,
+  canWrite,
+}: {
+  open: boolean
+  onClose: () => void
+  rules: RecurringMatchRule[]
+  recurringList: RecurringTransaction[]
+  accounts: { id: string; name: string; display_name?: string | null }[]
+  canWrite: boolean
+}) {
+  const { t } = useTranslation()
+  const queryClient = useQueryClient()
+  const [editing, setEditing] = useState<RecurringMatchRule | null>(null)
+  const [formOpen, setFormOpen] = useState(false)
+  const [name, setName] = useState('')
+  const [patterns, setPatterns] = useState('')
+  const [excludes, setExcludes] = useState('')
+  const [selected, setSelected] = useState<string[]>([])
+  const [searchAccountId, setSearchAccountId] = useState('')
+  const [searchType, setSearchType] = useState('')
+  const [accumulate, setAccumulate] = useState(false)
+  const [accumulateThreshold, setAccumulateThreshold] = useState('')
+  const [deleting, setDeleting] = useState<RecurringMatchRule | null>(null)
+
+  const refresh = () => {
+    queryClient.invalidateQueries({ queryKey: ['recurring', 'match-rules'] })
+    queryClient.invalidateQueries({ queryKey: ['recurring'] })
+    invalidateFinancialQueries(queryClient)
+  }
+
+  const closeForm = () => {
+    setFormOpen(false)
+    setEditing(null)
+  }
+
+  const createMutation = useMutation({
+    mutationFn: (payload: {
+      name: string
+      patterns: string[]
+      excludes: string[]
+      recurring_ids: string[]
+      search_account_id: string | null
+      search_type: string | null
+      accumulate: boolean
+      accumulate_threshold: string | null
+    }) => recurringApi.matchRules.create(payload),
+    onSuccess: () => {
+      refresh()
+      closeForm()
+      toast.success(t('recurring.ruleCreated'))
+    },
+    onError: (err: unknown) => toast.error(extractApiError(err, t('common.error'))),
+  })
+
+  const updateMutation = useMutation({
+    mutationFn: ({
+      id,
+      ...payload
+    }: {
+      id: string
+      name: string
+      patterns: string[]
+      excludes: string[]
+      recurring_ids: string[]
+      search_account_id: string | null
+      search_type: string | null
+      accumulate: boolean
+      accumulate_threshold: string | null
+    }) => recurringApi.matchRules.update(id, payload),
+    onSuccess: () => {
+      refresh()
+      closeForm()
+      toast.success(t('recurring.ruleUpdated'))
+    },
+    onError: (err: unknown) => toast.error(extractApiError(err, t('common.error'))),
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: (id: string) => recurringApi.matchRules.delete(id),
+    onSuccess: () => {
+      refresh()
+      setDeleting(null)
+      toast.success(t('recurring.ruleDeleted'))
+    },
+    onError: (err: unknown) => toast.error(extractApiError(err, t('common.error'))),
+  })
+
+  const splitTerms = (value: string) =>
+    value
+      .split(',')
+      .map((part) => part.trim())
+      .filter(Boolean)
+
+  const openCreate = () => {
+    setEditing(null)
+    setName('')
+    setPatterns('')
+    setExcludes('')
+    setSelected([])
+    setSearchAccountId('')
+    setSearchType('')
+    setAccumulate(false)
+    setAccumulateThreshold('')
+    setFormOpen(true)
+  }
+
+  const openEdit = (rule: RecurringMatchRule) => {
+    setEditing(rule)
+    setName(rule.name)
+    setPatterns(rule.patterns.join(', '))
+    setExcludes(rule.excludes.join(', '))
+    setSelected(rule.recurring_ids)
+    setSearchAccountId(rule.search_account_id ?? '')
+    setSearchType(rule.search_type ?? '')
+    setAccumulate(rule.accumulate ?? false)
+    setAccumulateThreshold(
+      rule.accumulate_threshold != null ? String(rule.accumulate_threshold) : '',
+    )
+    setFormOpen(true)
+  }
+
+  const submit = () => {
+    const payload = {
+      name: name.trim(),
+      patterns: splitTerms(patterns),
+      excludes: splitTerms(excludes),
+      recurring_ids: selected,
+      search_account_id: searchAccountId || null,
+      search_type: searchType || null,
+      accumulate,
+      accumulate_threshold: accumulate ? accumulateThreshold || null : null,
+    }
+    if (!payload.name || payload.patterns.length === 0) {
+      toast.error(t('recurring.ruleInvalid'))
+      return
+    }
+    if (editing) {
+      updateMutation.mutate({ id: editing.id, ...payload })
+    } else {
+      createMutation.mutate(payload)
+    }
+  }
+
+  const descriptionById = new Map(recurringList.map((rt) => [rt.id, rt.description]))
+  const accountNameById = new Map(accounts.map((acc) => [acc.id, getAccountName(acc)]))
+
+  return (
+    <>
+      <Dialog
+        open={open}
+        onOpenChange={(value) => {
+          if (!value) {
+            onClose()
+            closeForm()
+          }
+        }}
+      >
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>{t('recurring.rules')}</DialogTitle>
+          </DialogHeader>
+
+          <p className="text-xs text-muted-foreground">{t('recurring.rulesHint')}</p>
+
+          {canWrite && !formOpen && (
+            <div>
+              <Button size="sm" className="gap-1.5 h-8" onClick={openCreate}>
+                <Plus size={13} /> {t('recurring.ruleNew')}
+              </Button>
+            </div>
+          )}
+
+          {formOpen && (
+            <div className="space-y-3 rounded-lg border border-border p-3">
+              <div className="grid gap-1.5">
+                <Label htmlFor="rule-name">{t('recurring.ruleName')}</Label>
+                <Input
+                  id="rule-name"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="OpenAI"
+                />
+              </div>
+              {editing?.source_rule_id ? (
+                <p className="text-xs text-muted-foreground">
+                  {t('recurring.ruleBorrowedHint', {
+                    name: editing.source_rule_name ?? '',
+                  })}
+                </p>
+              ) : (
+                <>
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="rule-patterns">{t('recurring.rulePatterns')}</Label>
+                    <Input
+                      id="rule-patterns"
+                      value={patterns}
+                      onChange={(e) => setPatterns(e.target.value)}
+                      placeholder="openai"
+                    />
+                  </div>
+                  <div className="grid gap-1.5">
+                    <Label htmlFor="rule-excludes">{t('recurring.ruleExcludes')}</Label>
+                    <Input
+                      id="rule-excludes"
+                      value={excludes}
+                      onChange={(e) => setExcludes(e.target.value)}
+                      placeholder="iof"
+                    />
+                  </div>
+                </>
+              )}
+              <div className="grid grid-cols-2 gap-2">
+                <div className="grid gap-1.5">
+                  <Label htmlFor="rule-search-account">{t('recurring.ruleSearchWhere')}</Label>
+                  <select
+                    id="rule-search-account"
+                    className="w-full border border-border rounded-lg px-3 py-2 text-sm bg-card text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                    value={searchAccountId}
+                    onChange={(e) => setSearchAccountId(e.target.value)}
+                  >
+                    <option value="">{t('recurring.ruleSearchSameAccount')}</option>
+                    {accounts.map((acc) => (
+                      <option key={acc.id} value={acc.id}>{getAccountName(acc)}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="rule-search-type">{t('recurring.ruleSearchDirection')}</Label>
+                  <select
+                    id="rule-search-type"
+                    className="w-full border border-border rounded-lg px-3 py-2 text-sm bg-card text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                    value={searchType}
+                    onChange={(e) => setSearchType(e.target.value)}
+                  >
+                    <option value="">{t('recurring.ruleSearchSameType')}</option>
+                    <option value="debit">{t('recurring.expense')}</option>
+                    <option value="credit">{t('recurring.income')}</option>
+                  </select>
+                </div>
+              </div>
+              <p className="text-[11px] text-muted-foreground">{t('recurring.ruleSearchHint')}</p>
+              <label className="flex items-start gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={accumulate}
+                  onChange={(e) => setAccumulate(e.target.checked)}
+                  className="h-4 w-4 mt-0.5 rounded border-border"
+                />
+                <span className="text-xs text-foreground">
+                  {t('recurring.ruleAccumulate')}
+                  <span className="block text-[11px] text-muted-foreground">{t('recurring.ruleAccumulateHint')}</span>
+                </span>
+              </label>
+              {accumulate && (
+                <div className="grid gap-1.5">
+                  <Label htmlFor="rule-threshold">{t('recurring.ruleAccumulateThreshold')}</Label>
+                  <Input
+                    id="rule-threshold"
+                    type="number"
+                    step="0.01"
+                    value={accumulateThreshold}
+                    onChange={(e) => setAccumulateThreshold(e.target.value)}
+                    placeholder={t('recurring.ruleAccumulateThresholdPlaceholder')}
+                  />
+                </div>
+              )}
+              <div className="grid gap-1.5">
+                <Label>{t('recurring.ruleRecurrings')}</Label>
+                <div className="max-h-40 overflow-auto rounded-md border border-border p-2 space-y-1">
+                  {recurringList.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">{t('recurring.empty')}</p>
+                  ) : (
+                    recurringList.map((rt) => (
+                      <label
+                        key={rt.id}
+                        className="flex items-center gap-2 text-xs text-foreground"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selected.includes(rt.id)}
+                          onChange={() =>
+                            setSelected((prev) =>
+                              prev.includes(rt.id)
+                                ? prev.filter((id) => id !== rt.id)
+                                : [...prev, rt.id],
+                            )
+                          }
+                        />
+                        <span className="truncate">{rt.description}</span>
+                      </label>
+                    ))
+                  )}
+                </div>
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" size="sm" onClick={closeForm}>
+                  {t('common.cancel')}
+                </Button>
+                <Button
+                  size="sm"
+                  onClick={submit}
+                  disabled={createMutation.isPending || updateMutation.isPending}
+                >
+                  {t('common.save')}
+                </Button>
+              </div>
+            </div>
+          )}
+
+          <div className="max-h-72 overflow-auto divide-y divide-border rounded-lg border border-border">
+            {rules.length === 0 ? (
+              <p className="text-sm text-muted-foreground text-center py-8">
+                {t('recurring.ruleEmpty')}
+              </p>
+            ) : (
+              rules.map((rule) => (
+                <div key={rule.id} className="flex items-start gap-3 p-3">
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-foreground">{rule.name}</p>
+                    {rule.source_rule_id && (
+                      <p className="text-[11px] text-violet-600 dark:text-violet-300 mt-0.5">
+                        {t('recurring.ruleFromSource', {
+                          name: rule.source_rule_name ?? '',
+                        })}
+                      </p>
+                    )}
+                    <div className="flex flex-wrap gap-1 mt-1">
+                      {rule.patterns.map((pattern) => (
+                        <span
+                          key={pattern}
+                          className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-foreground"
+                        >
+                          {pattern}
+                        </span>
+                      ))}
+                      {rule.excludes.map((term) => (
+                        <span
+                          key={term}
+                          className="rounded-full bg-rose-50 px-1.5 py-0.5 text-[10px] text-rose-600 dark:bg-rose-950/40 dark:text-rose-300"
+                        >
+                          {t('recurring.ruleExcept', { term })}
+                        </span>
+                      ))}
+                      {rule.accumulate && (
+                        <span className="rounded-full bg-amber-50 px-1.5 py-0.5 text-[10px] text-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
+                          {rule.accumulate_threshold != null
+                            ? t('recurring.ruleAccumulateChip', {
+                                value: rule.accumulate_threshold,
+                              })
+                            : t('recurring.ruleAccumulateChipDefault')}
+                        </span>
+                      )}
+                      {(rule.search_account_id || rule.search_type) && (
+                        <span className="rounded-full bg-sky-50 px-1.5 py-0.5 text-[10px] text-sky-700 dark:bg-sky-950/40 dark:text-sky-300">
+                          {t('recurring.ruleSearchChip', {
+                            where: rule.search_account_id
+                              ? accountNameById.get(rule.search_account_id) ?? '—'
+                              : t('recurring.ruleSearchSameAccount'),
+                            direction: rule.search_type
+                              ? rule.search_type === 'credit'
+                                ? t('recurring.income')
+                                : t('recurring.expense')
+                              : t('recurring.ruleSearchSameType'),
+                          })}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-muted-foreground mt-1 truncate">
+                      {rule.recurring_ids
+                        .map((rid) => descriptionById.get(rid) ?? '—')
+                        .join(' · ') || t('recurring.ruleNoRecurrings')}
+                    </p>
+                  </div>
+                  {canWrite && (
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        className="p-1.5 rounded-md text-muted-foreground hover:text-primary hover:bg-primary/5 transition-colors"
+                        onClick={() => openEdit(rule)}
+                        aria-label={t('common.edit')}
+                        title={t('common.edit')}
+                      >
+                        <Pencil size={13} />
+                      </button>
+                      <button
+                        className="p-1.5 rounded-md text-muted-foreground hover:text-rose-500 hover:bg-rose-50 transition-colors"
+                        onClick={() => setDeleting(rule)}
+                        aria-label={t('common.delete')}
+                        title={t('common.delete')}
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={onClose}>
+              {t('common.close')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <DeleteConfirmationDialog
+        open={!!deleting}
+        title={t('recurring.ruleDeleteTitle')}
+        description={t('recurring.ruleDeleteDescription', { name: deleting?.name })}
+        isPending={deleteMutation.isPending}
+        onClose={() => setDeleting(null)}
+        onConfirm={() => deleting && deleteMutation.mutate(deleting.id)}
+      />
     </>
   )
 }
@@ -305,6 +901,8 @@ function RecurringForm({
   categoryGroups,
   currentCategory,
   accounts,
+  matchRules,
+  normalRules,
   onSave,
   onCancel,
   loading,
@@ -314,7 +912,9 @@ function RecurringForm({
   categoryGroups: CategoryGroup[]
   currentCategory?: Category
   accounts: { id: string; name: string; display_name?: string | null }[]
-  onSave: (data: Partial<RecurringTransaction>) => void
+  matchRules: RecurringMatchRule[]
+  normalRules: Rule[]
+  onSave: (data: Partial<RecurringTransaction>, ruleChoice: RuleChoice) => void
   onCancel: () => void
   loading: boolean
 }) {
@@ -343,27 +943,79 @@ function RecurringForm({
   const [isActive, setIsActive] = useState(recurring?.is_active ?? true)
   const [autoGenerate, setAutoGenerate] = useState(recurring?.auto_generate ?? true)
 
+  const currentRule = useMemo(
+    () =>
+      matchRules.find(
+        (rule) => recurring && rule.recurring_ids.includes(recurring.id),
+      ) ?? null,
+    [matchRules, recurring],
+  )
+  const [ruleSelection, setRuleSelection] = useState<string>(currentRule?.id ?? '')
+  const [newRuleName, setNewRuleName] = useState('')
+  const [newRulePatterns, setNewRulePatterns] = useState('')
+  const [newRuleExcludes, setNewRuleExcludes] = useState('')
+  const [newRuleAccount, setNewRuleAccount] = useState('')
+  const [newRuleType, setNewRuleType] = useState('')
+  const [newRuleAccumulate, setNewRuleAccumulate] = useState(false)
+  const [newRuleThreshold, setNewRuleThreshold] = useState('')
+
   const selectClass = 'w-full border border-border rounded-lg px-3 py-2 text-sm bg-card text-foreground focus:outline-none focus:ring-2 focus:ring-primary'
+
+  const splitTerms = (value: string) =>
+    value
+      .split(',')
+      .map((part) => part.trim())
+      .filter(Boolean)
+
+  const ruleChoiceFromState = (): RuleChoice | null => {
+    if (ruleSelection === '__new__') {
+      const patterns = splitTerms(newRulePatterns)
+      if (patterns.length === 0) {
+        toast.error(t('recurring.ruleInvalid'))
+        return null
+      }
+      return {
+        type: 'new',
+        name: newRuleName.trim() || description,
+        patterns,
+        excludes: splitTerms(newRuleExcludes),
+        searchAccountId: newRuleAccount || undefined,
+        searchType: newRuleType || undefined,
+        accumulate: newRuleAccumulate,
+        accumulateThreshold: newRuleAccumulate ? newRuleThreshold : undefined,
+      }
+    }
+    if (ruleSelection.startsWith('src:')) {
+      return { type: 'import', sourceRuleId: ruleSelection.slice(4) }
+    }
+    if (ruleSelection) return { type: 'existing', ruleId: ruleSelection }
+    return { type: 'none' }
+  }
 
   return (
     <form
       onSubmit={(e) => {
         e.preventDefault()
-        onSave({
-          description,
-          amount: parseFloat(amount),
-          currency,
-          type,
-          frequency,
-          weekend_adjustment: weekendAdjustment,
-          day_of_month: dayOfMonth ? parseInt(dayOfMonth) : null,
-          start_date: startDate,
-          end_date: endDate || null,
-          category_id: categoryId || null,
-          account_id: accountId || null,
-          is_active: isActive,
-          auto_generate: autoGenerate,
-        } as Partial<RecurringTransaction>)
+        const ruleChoice = ruleChoiceFromState()
+        if (ruleChoice === null) return
+        onSave(
+          {
+            description,
+            amount: parseFloat(amount),
+            currency,
+            type,
+            frequency,
+            weekend_adjustment: weekendAdjustment,
+            day_of_month: dayOfMonth ? parseInt(dayOfMonth) : null,
+            start_date: startDate,
+            end_date: endDate || null,
+            category_id: categoryId || null,
+            account_id: accountId || null,
+            is_active: isActive,
+            auto_generate: autoGenerate,
+          } as Partial<RecurringTransaction>,
+          ruleChoice,
+        )
       }}
       className="space-y-4"
     >
@@ -460,6 +1112,104 @@ function RecurringForm({
             ))}
           </select>
         </div>
+      </div>
+      <div className="space-y-2">
+        <Label>{t('recurring.identificationRule')}</Label>
+        <select
+          className={selectClass}
+          value={ruleSelection}
+          onChange={(e) => setRuleSelection(e.target.value)}
+        >
+          <option value="">{t('recurring.ruleNone')}</option>
+          {matchRules.length > 0 && (
+            <optgroup label={t('recurring.rules')}>
+              {matchRules.map((rule) => (
+                <option key={rule.id} value={rule.id}>
+                  {rule.name}
+                </option>
+              ))}
+            </optgroup>
+          )}
+          {normalRules.filter((rule) => rule.is_active).length > 0 && (
+            <optgroup label={t('recurring.ruleFromRules')}>
+              {normalRules
+                .filter((rule) => rule.is_active)
+                .map((rule) => (
+                  <option key={rule.id} value={`src:${rule.id}`}>
+                    {rule.name}
+                  </option>
+                ))}
+            </optgroup>
+          )}
+          <option value="__new__">{t('recurring.ruleCreateInline')}</option>
+        </select>
+        <p className="text-[11px] text-muted-foreground">
+          {t('recurring.identificationRuleHint')}
+        </p>
+        {ruleSelection === '__new__' && (
+          <div className="space-y-2 rounded-lg border border-border p-3">
+            <Input
+              value={newRuleName}
+              onChange={(e) => setNewRuleName(e.target.value)}
+              placeholder={t('recurring.ruleName')}
+            />
+            <Input
+              value={newRulePatterns}
+              onChange={(e) => setNewRulePatterns(e.target.value)}
+              placeholder={t('recurring.rulePatterns')}
+            />
+            <Input
+              value={newRuleExcludes}
+              onChange={(e) => setNewRuleExcludes(e.target.value)}
+              placeholder={t('recurring.ruleExcludes')}
+            />
+            <div className="grid grid-cols-2 gap-2">
+              <select
+                className={selectClass}
+                value={newRuleAccount}
+                onChange={(e) => setNewRuleAccount(e.target.value)}
+                title={t('recurring.ruleSearchWhere')}
+              >
+                <option value="">{t('recurring.ruleSearchSameAccount')}</option>
+                {sortedAccounts.map((acc) => (
+                  <option key={acc.id} value={acc.id}>{getAccountName(acc)}</option>
+                ))}
+              </select>
+              <select
+                className={selectClass}
+                value={newRuleType}
+                onChange={(e) => setNewRuleType(e.target.value)}
+                title={t('recurring.ruleSearchDirection')}
+              >
+                <option value="">{t('recurring.ruleSearchSameType')}</option>
+                <option value="debit">{t('recurring.expense')}</option>
+                <option value="credit">{t('recurring.income')}</option>
+              </select>
+            </div>
+            <p className="text-[11px] text-muted-foreground">{t('recurring.ruleSearchHint')}</p>
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={newRuleAccumulate}
+                onChange={(e) => setNewRuleAccumulate(e.target.checked)}
+                className="h-4 w-4 mt-0.5 rounded border-border"
+              />
+              <span className="text-xs text-foreground">
+                {t('recurring.ruleAccumulate')}
+                <span className="block text-[11px] text-muted-foreground">{t('recurring.ruleAccumulateHint')}</span>
+              </span>
+            </label>
+            {newRuleAccumulate && (
+              <Input
+                type="number"
+                step="0.01"
+                value={newRuleThreshold}
+                onChange={(e) => setNewRuleThreshold(e.target.value)}
+                placeholder={t('recurring.ruleAccumulateThreshold')}
+              />
+            )}
+          </div>
+        )}
       </div>
       <label className="flex items-start gap-2 cursor-pointer">
         <input

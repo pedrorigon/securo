@@ -41,6 +41,13 @@ class SpendingByCategory(BaseModel):
     # Actual plus forecast, mirroring the card's projected sub-line.
     projected_total: float = 0.0
     percentage: float
+    # The category's group, so the same rows can be read per group without a
+    # second endpoint. Null for "Sem categoria" and for a category nobody
+    # filed under a group yet.
+    group_id: Optional[str] = None
+    group_name: Optional[str] = None
+    group_icon: Optional[str] = None
+    group_color: Optional[str] = None
 
 
 class MonthlyTrend(BaseModel):
@@ -72,3 +79,5 @@ class ProjectedTransaction(BaseModel):
     category_name: Optional[str]
     category_icon: Optional[str]
     category_color: Optional[str] = None
+    #: forecast | overdue | missed — see dashboard_service.projection_state.
+    state: str = "forecast"

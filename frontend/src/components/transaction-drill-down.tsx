@@ -1,21 +1,26 @@
 import { useEffect, useRef, useMemo } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useDisplayLocale, useDateLocale } from '@/hooks/use-display-locale'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { transactions as transactionsApi, dashboard, admin } from '@/lib/api'
-import { AlertTriangle, Clock, Info, Paperclip, X } from 'lucide-react'
+import { AlertTriangle, Clock, Info, Paperclip, Unlink, X } from 'lucide-react'
 import { CategoryIcon } from '@/components/category-icon'
 import { ProjectedTransactionBadge } from '@/components/projected-transaction-badge'
 import { sumDrillDownTotals } from '@/lib/drill-down-totals'
+import { stateForPlaceholder } from '@/lib/recurring-state'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { useAuth } from '@/contexts/auth-context'
 import { usePrivacyMode } from '@/hooks/use-privacy-mode'
-import type { Transaction } from '@/types'
+import { toast } from 'sonner'
+import type { RecurringProjectionState, Transaction } from '@/types'
 import { formatCurrency } from '@/lib/format'
 
 export type DrillDownFilter = {
   title: string
   category_id?: string
+  // Scope to a set of categories (e.g. one category group).
+  category_ids?: string[]
   uncategorized?: boolean
   account_id?: string
   // Scope to a set of accounts (e.g. the active collection's accounts).
@@ -40,6 +45,13 @@ type DisplayItem = {
   isPending: boolean
   attachmentCount: number
   transaction: Transaction | null
+  // Where an expected occurrence stands (null for ordinary rows). Drives the
+  // badge colour, the tooltip and whether the row counts toward the totals.
+  recurringState: RecurringProjectionState | null
+  // A placeholder that became a real charge still points at its recurring
+  // bill; the row offers to undo that link when the match was wrong.
+  recurringLinkId: string | null
+  isMissed: boolean
 }
 
 export function TransactionDrillDown({
@@ -58,12 +70,18 @@ export function TransactionDrillDown({
   const locale = useDisplayLocale()
   const dateLocale = useDateLocale()
   const panelRef = useRef<HTMLDivElement>(null)
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
 
+  // Only the drill-down asks for expired placeholders: every other surface
+  // must not total a month that ended without the charge, but a person
+  // looking at a category deserves to see what never arrived.
   const { data, isLoading } = useQuery({
     queryKey: ['drill-down', filter],
     queryFn: () =>
       transactionsApi.list({
         category_id: filter?.category_id,
+        category_ids: filter?.category_ids,
         uncategorized: filter?.uncategorized,
         account_id: filter?.account_id,
         account_ids: filter?.account_ids,
@@ -72,6 +90,7 @@ export function TransactionDrillDown({
         to: filter?.to,
         limit: 200,
         user_pnl_only: true,
+        include_missed: true,
       }),
     enabled: !!filter,
   })
@@ -80,9 +99,23 @@ export function TransactionDrillDown({
   const monthParam = filter?.from ? filter.from.slice(0, 7) + '-01' : undefined
 
   const { data: projectedTxs } = useQuery({
-    queryKey: ['dashboard', 'projected-transactions', monthParam],
-    queryFn: () => dashboard.projectedTransactions({ month: monthParam }),
+    queryKey: ['dashboard', 'projected-transactions', monthParam, 'with-missed'],
+    queryFn: () => dashboard.projectedTransactions({ month: monthParam, include_missed: true }),
     enabled: !!filter && !!monthParam,
+  })
+
+  const unlinkMutation = useMutation({
+    mutationFn: (id: string) => transactionsApi.unlinkRecurring(id),
+    onSuccess: () => {
+      // The forecast comes back and the charge returns to its own name, so
+      // everything that showed either has to be re-read.
+      queryClient.invalidateQueries({ queryKey: ['drill-down'] })
+      queryClient.invalidateQueries({ queryKey: ['dashboard'] })
+      queryClient.invalidateQueries({ queryKey: ['transactions'] })
+      queryClient.invalidateQueries({ queryKey: ['recurring'] })
+      toast.success(t('transactions.recurringUnlinked'))
+    },
+    onError: () => toast.error(t('common.error')),
   })
 
   const { data: accountingModeData } = useQuery({
@@ -97,6 +130,7 @@ export function TransactionDrillDown({
     const items: DisplayItem[] = []
 
     for (const tx of data?.items ?? []) {
+      const recurringState = stateForPlaceholder(tx)
       items.push({
         key: tx.id,
         description: tx.description,
@@ -112,6 +146,9 @@ export function TransactionDrillDown({
         isPending: tx.status === 'pending',
         attachmentCount: tx.attachment_count ?? 0,
         transaction: tx,
+        recurringState,
+        recurringLinkId: tx.recurring_transaction_id ?? null,
+        isMissed: recurringState === 'missed',
       })
     }
 
@@ -119,6 +156,12 @@ export function TransactionDrillDown({
       // Filter projected txs by drill-down criteria
       if (filter?.type && pt.type !== filter.type) continue
       if (filter?.category_id && String(pt.category_id) !== filter.category_id) continue
+      if (
+        filter?.category_ids &&
+        (pt.category_id == null || !filter.category_ids.includes(pt.category_id))
+      ) {
+        continue
+      }
       if (filter?.uncategorized && pt.category_id != null) continue
       if (filter?.from && pt.date < filter.from) continue
       if (filter?.to && pt.date > filter.to) continue
@@ -138,6 +181,9 @@ export function TransactionDrillDown({
         isPending: false,
         attachmentCount: 0,
         transaction: null,
+        recurringState: pt.state ?? 'forecast',
+        recurringLinkId: null,
+        isMissed: pt.state === 'missed',
       })
     }
 
@@ -177,14 +223,16 @@ export function TransactionDrillDown({
   // amount_primary; if it's missing we can't convert, so skip the row
   // instead of adding a raw foreign amount as if it were primary. This
   // matches how get_summary computes monthly_*_primary on the backend.
-  const { absTotal, postedTotal, pendingTotal, projectedTotal } =
+  const { absTotal, postedTotal, pendingTotal, projectedTotal, missedTotal } =
     sumDrillDownTotals(displayItems, userCurrency)
 
   // Break the total down whenever some of it is money that has not settled,
   // whether it is pending or still only projected. Gating on pending alone
   // hid the projected line from a panel that happened to have no pending row,
-  // even though the total it sits under already counted the projection.
-  const hasUnsettledTotal = pendingTotal > 0 || projectedTotal > 0
+  // even though the total it sits under already counted the projection. A
+  // missed occurrence forces the breakdown too: it is listed but deliberately
+  // outside the bottom line, and the footer has to say so.
+  const hasUnsettledTotal = pendingTotal > 0 || projectedTotal > 0 || missedTotal > 0
 
   return (
     <>
@@ -240,9 +288,14 @@ export function TransactionDrillDown({
               {displayItems.map((item) => (
                 <div
                   key={item.key}
-                  className={`flex items-center gap-3 px-5 py-3 hover:bg-muted transition-colors ${!item.isProjected ? 'cursor-pointer' : ''}`}
+                  className={`flex items-center gap-3 px-5 py-3 hover:bg-muted transition-colors ${!item.isProjected || item.isMissed ? 'cursor-pointer' : ''}`}
                   onClick={() => {
-                    if (!item.isProjected && item.transaction) {
+                    if (item.isMissed) {
+                      // Clicking a missed forecast is the moment somebody
+                      // decides to keep the bill or archive it.
+                      onClose()
+                      navigate('/recurring')
+                    } else if (!item.isProjected && item.transaction) {
                       onTransactionClick?.(item.transaction)
                     }
                   }}
@@ -254,11 +307,34 @@ export function TransactionDrillDown({
                   />
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
-                      <p className="text-sm font-medium text-foreground truncate">{item.description}</p>
-                      {item.isProjected && (
+                      <p
+                        className={`text-sm font-medium truncate ${
+                          item.recurringState === 'overdue'
+                            ? 'text-rose-600 dark:text-rose-400'
+                            : item.isMissed
+                              ? 'text-neutral-700 dark:text-neutral-300'
+                              : 'text-foreground'
+                        }`}
+                      >
+                        {item.description}
+                      </p>
+                      {item.recurringState && item.recurringState !== 'forecast' ? (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span className="shrink-0">
+                              <ProjectedTransactionBadge state={item.recurringState} />
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            {item.isMissed
+                              ? t('transactions.missedTooltip')
+                              : t('transactions.overdueTooltip')}
+                          </TooltipContent>
+                        </Tooltip>
+                      ) : item.isProjected ? (
                         <ProjectedTransactionBadge />
-                      )}
-                      {item.isPending && (
+                      ) : null}
+                      {item.isPending && item.recurringState !== 'overdue' && (
                         <Tooltip>
                           <TooltipTrigger asChild>
                             <span className="shrink-0 inline-flex items-center justify-center rounded-full border border-amber-200 bg-amber-50 p-0.5 dark:border-amber-500/30 dark:bg-amber-500/10">
@@ -266,6 +342,24 @@ export function TransactionDrillDown({
                             </span>
                           </TooltipTrigger>
                           <TooltipContent>{t('transactions.pending')}</TooltipContent>
+                        </Tooltip>
+                      )}
+                      {item.recurringLinkId && !item.isProjected && !item.recurringState && (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <button
+                              className="shrink-0 p-1 rounded-md text-muted-foreground hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                if (item.transaction) unlinkMutation.mutate(item.transaction.id)
+                              }}
+                              disabled={unlinkMutation.isPending}
+                              aria-label={t('transactions.unlinkRecurringHint')}
+                            >
+                              <Unlink size={12} />
+                            </button>
+                          </TooltipTrigger>
+                          <TooltipContent>{t('transactions.unlinkRecurringHint')}</TooltipContent>
                         </Tooltip>
                       )}
                       {item.attachmentCount > 0 && (
@@ -280,7 +374,11 @@ export function TransactionDrillDown({
                   <div className="text-right shrink-0">
                     <span
                       className={`text-sm font-semibold tabular-nums ${
-                        item.type === 'credit' ? 'text-emerald-600' : 'text-rose-500'
+                        item.isMissed
+                          ? 'text-muted-foreground'
+                          : item.type === 'credit'
+                            ? 'text-emerald-600'
+                            : 'text-rose-500'
                       }`}
                     >
                       {item.type === 'credit' ? '+' : '-'}
@@ -320,6 +418,12 @@ export function TransactionDrillDown({
                   <div className="flex items-center justify-between gap-4 text-xs text-muted-foreground">
                     <span>{t('transactions.projected')}</span>
                     <span className="tabular-nums text-foreground">{mask(formatCurrency(projectedTotal, userCurrency, locale))}</span>
+                  </div>
+                )}
+                {missedTotal > 0 && (
+                  <div className="flex items-center justify-between gap-4 text-xs text-muted-foreground">
+                    <span>{t('dashboard.drillDownMissedTotal')}</span>
+                    <span className="tabular-nums text-neutral-700 dark:text-neutral-300">{mask(formatCurrency(missedTotal, userCurrency, locale))}</span>
                   </div>
                 )}
                 <div className="flex items-center justify-between gap-4 border-t border-border pt-2 mt-2">

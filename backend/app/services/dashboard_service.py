@@ -3,7 +3,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import select, func, case, or_
+from sqlalchemy import select, func, case, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -12,6 +12,7 @@ from app.models.account import Account
 from app.models.bank_connection import BankConnection
 from app.models.transaction import Transaction
 from app.models.category import Category
+from app.models.category_group import CategoryGroup
 from app.models.recurring_transaction import RecurringTransaction
 from app.schemas.dashboard import DashboardSummary, SpendingByCategory, MonthlyTrend, ProjectedTransaction, DailyBalance, BalanceHistory
 from app.services._query_filters import (
@@ -38,6 +39,49 @@ def _month_range(month: date) -> tuple[date, date]:
     else:
         month_end = month.replace(month=month.month + 1, day=1)
     return month_start, month_end
+
+
+def next_business_day(when: date) -> date:
+    """The next weekday after ``when``. Weekends skipped, holidays not."""
+    candidate = when + timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def projection_state(
+    occurrence: date, today: date, created_month: Optional[date] = None
+) -> str:
+    """Where one expected occurrence stands, in one place.
+
+    ``missed`` is a month that ended with the charge never arriving;
+    ``overdue`` is one business day past the occurrence with the month still
+    open; anything else is still a ``forecast``. Kept as a module-level
+    function because the panel, the totals and every exclusion must agree on
+    exactly one definition of each word.
+
+    ``created_month`` is the first day of the month the bill was created in,
+    when it is known. Occurrences before it are never ``missed``: nobody was
+    waiting for a charge before they had written the bill down, and marking
+    someone's history with a promise they never made is not this feature's
+    job. Occurrences after it answer for themselves — a month that ends
+    without the charge is a month that ended without the charge.
+    """
+    if occurrence < today.replace(day=1):
+        if created_month is not None and occurrence.replace(day=1) < created_month:
+            return "forecast"
+        return "missed"
+    if next_business_day(occurrence) <= today:
+        return "overdue"
+    return "forecast"
+
+
+def _created_month(recurring: RecurringTransaction) -> Optional[date]:
+    """First day of the month a bill was created in, or None if unknown."""
+    created = recurring.created_at
+    if created is None:
+        return None
+    return created.date().replace(day=1)
 
 
 async def _materialized_recurring_occurrences(
@@ -123,6 +167,7 @@ async def _get_recurring_projections(
         month_end,
     )
 
+    today = date.today()
     projections = []
     for rec in recurring_list:
         # Compute occurrences from the nominal pointer; linked rows are
@@ -138,6 +183,11 @@ async def _get_recurring_projections(
         )
         for occ_date in occurrences:
             if (rec.id, occ_date) in materialized_occurrences:
+                continue
+            # A month that ended without the charge is not money anyone
+            # spent or received: it only ever appears in the drill-down,
+            # marked, so it must not reach a P&L, budget or balance number.
+            if projection_state(occ_date, today, _created_month(rec)) == "missed":
                 continue
             projections.append({
                 "category_id": rec.category_id,
@@ -182,6 +232,16 @@ async def _get_forecast_transactions(
             or_(
                 Transaction.status == "pending",
                 bucket_date > today,
+            ),
+            # A placeholder left behind by a month that ended is a forecast
+            # that never happened. It is still shown in the drill-down, where
+            # it can be read and dismissed, but it has no business in a
+            # balance projection: only real pending charges and future rows
+            # move a forecast.
+            ~and_(
+                Transaction.source == "recurring",
+                Transaction.external_id.is_(None),
+                Transaction.date < today.replace(day=1),
             ),
         )
         .options(
@@ -482,12 +542,20 @@ async def get_summary(
     monthly_income_primary = real_monthly_income
     monthly_expenses_primary = abs(real_monthly_expenses)
 
-    # Use amount_primary sums for more accurate multi-currency income/expenses.
-    # Same posted-only rule as the native-currency totals above.
+    # Multi-currency income/expenses: a row already in the primary currency
+    # counts by its own amount, and amount_primary is only what a real
+    # conversion produced. A provider can report 83,33 on the statement and
+    # 83,35 as the account-currency figure of the same 1:1 charge; the panel
+    # shows the row's amount, so the totals must read it too, or the two
+    # screens disagree by cents. Same posted-only rule as above.
+    primary_amount = case(
+        (Transaction.currency == primary_currency, Transaction.amount),
+        else_=Transaction.amount_primary,
+    )
     primary_result = await session.execute(
         select(
-            func.sum(case((Transaction.type == "credit", Transaction.amount_primary), else_=0)),
-            func.sum(case((Transaction.type == "debit", Transaction.amount_primary), else_=0)),
+            func.sum(case((Transaction.type == "credit", primary_amount), else_=0)),
+            func.sum(case((Transaction.type == "debit", primary_amount), else_=0)),
         )
         .join(Account, Transaction.account_id == Account.id)
         .where(
@@ -499,7 +567,6 @@ async def get_summary(
             Transaction.source != "opening_balance",
             Transaction.status == "posted",
             counts_as_user_pnl(),
-            Transaction.amount_primary.isnot(None),
             *acct_filter,
         )
     )
@@ -597,7 +664,11 @@ async def get_summary(
     for tx in forecast_transactions:
         if not _counts_as_user_pnl_row(tx):
             continue
-        if tx.amount_primary is not None:
+        if tx.currency == primary_currency:
+            # The same rule the settled totals follow: same money, its own
+            # number — never a conversion artifact.
+            forecast_converted = Decimal(str(tx.amount))
+        elif tx.amount_primary is not None:
             forecast_converted = Decimal(str(tx.amount_primary))
         else:
             forecast_converted, _ = await convert(
@@ -910,9 +981,37 @@ async def get_spending_by_category(
     # `total` stays posted-only so the breakdown adds up to the expenses card,
     # which is also posted-only. The forecast rides along in `projected_total`
     # (actual + forecast) for callers that want the same split the card shows.
+    # One bulk pass for the groups: every row above was built from different
+    # sources (the grouped query, split offsets, shared shares, projections,
+    # forecast rows), and each would otherwise need its own join. A single
+    # category → group lookup keeps them all consistent, including hidden
+    # categories that never showed up in the categories screen.
+    group_meta: dict[str, dict] = {}
+    known_cat_ids = [uuid.UUID(cat_id) for cat_id in spending_map if cat_id]
+    if known_cat_ids:
+        group_rows = await session.execute(
+            select(
+                Category.id,
+                CategoryGroup.id,
+                CategoryGroup.name,
+                CategoryGroup.icon,
+                CategoryGroup.color,
+            )
+            .outerjoin(CategoryGroup, Category.group_id == CategoryGroup.id)
+            .where(Category.id.in_(known_cat_ids))
+        )
+        for cat_uuid, group_id, group_name, group_icon, group_color in group_rows.all():
+            group_meta[str(cat_uuid)] = {
+                "group_id": str(group_id) if group_id else None,
+                "group_name": group_name,
+                "group_icon": group_icon,
+                "group_color": group_color,
+            }
+
     grand_total = sum(entry["total"] for entry in spending_map.values())
     spending = []
     for cat_id, entry in sorted(spending_map.items(), key=lambda x: x[1]["total"], reverse=True):
+        meta = group_meta.get(cat_id or "", {})
         spending.append(SpendingByCategory(
             category_id=cat_id,
             category_name=entry["name"],
@@ -921,6 +1020,10 @@ async def get_spending_by_category(
             total=entry["total"],
             projected_total=entry["total"] + entry.get("projected", 0.0),
             percentage=(entry["total"] / grand_total * 100) if grand_total else 0,
+            group_id=meta.get("group_id"),
+            group_name=meta.get("group_name"),
+            group_icon=meta.get("group_icon"),
+            group_color=meta.get("group_color"),
         ))
 
     return spending
@@ -1055,6 +1158,7 @@ async def get_projected_transactions(
     account_id: Optional[uuid.UUID] = None,
     from_date: Optional[date] = None,
     to_date: Optional[date] = None,
+    include_missed: bool = False,
 ) -> list[ProjectedTransaction]:
     """Return virtual recurring transaction projections for a month,
     enriched with description and category info for display.
@@ -1066,6 +1170,11 @@ async def get_projected_transactions(
     P&L, and an investment contribution is money that will leave the account.
     The P&L-shaped callers exclude them on their own side, through
     ``_get_recurring_projections(include_transfer_like=False)``.
+
+    Each row carries its ``state`` (forecast, overdue, missed). Occurrences
+    from a month that ended are omitted unless ``include_missed`` is set: the
+    drill-down asks for them so a person can see what never arrived, while
+    every other surface must not total money that was never spent.
     """
     if (from_date is None) != (to_date is None):
         raise ValueError("from_date and to_date must be provided together")
@@ -1119,6 +1228,7 @@ async def get_projected_transactions(
         for row in cat_result.all():
             cat_map[row[0]] = (row[1], row[2], row[3])
 
+    today = date.today()
     projections: list[ProjectedTransaction] = []
     for rec in recurring_list:
         occurrences = get_occurrences_in_range(
@@ -1148,6 +1258,9 @@ async def get_projected_transactions(
         for occ_date in occurrences:
             if (rec.id, occ_date) in materialized_occurrences:
                 continue
+            state = projection_state(occ_date, today, _created_month(rec))
+            if state == "missed" and not include_missed:
+                continue
             projections.append(ProjectedTransaction(
                 recurring_id=str(rec.id),
                 account_id=str(rec.account_id) if rec.account_id else None,
@@ -1161,6 +1274,7 @@ async def get_projected_transactions(
                 category_name=cat_name,
                 category_icon=cat_icon,
                 category_color=cat_color,
+                state=state,
             ))
 
     return projections

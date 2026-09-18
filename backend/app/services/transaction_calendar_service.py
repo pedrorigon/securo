@@ -22,6 +22,7 @@ from app.services.dashboard_service import (
     _balance_at,
     _daily_balance_deltas_by_date,
     _get_forecast_transactions,
+    projection_state,
 )
 from app.services.fx_rate_service import convert as fx_convert
 from app.services.recurring_transaction_service import (
@@ -403,8 +404,21 @@ def _forecast_item(
     )
 
 
-def _count_occurrences_before(recurring: RecurringTransaction, end: date) -> int:
-    """Count still-virtual effective occurrences before ``end`` without truncating."""
+def _count_occurrences_before(
+    recurring: RecurringTransaction, end: date, today: date
+) -> int:
+    """Count still-virtual effective occurrences before ``end`` without truncating.
+
+    Occurrences from a month that ended unanswered are not carried: a
+    forecast that never happened must not move a projected balance. Months
+    before the bill existed are still carried, because they were never
+    anyone's unanswered promise.
+    """
+    created_month = (
+        recurring.created_at.date().replace(day=1)
+        if recurring.created_at
+        else None
+    )
     nominal_start = recurring.next_occurrence
     first_effective = adjust_weekend_date(
         nominal_start, recurring.weekend_adjustment
@@ -432,7 +446,11 @@ def _count_occurrences_before(recurring: RecurringTransaction, end: date) -> int
             intended_day=recurring.day_of_month or recurring.start_date.day,
             weekend_adjustment=recurring.weekend_adjustment,
         )
-        count += len(occurrences)
+        count += sum(
+            1
+            for occurrence in occurrences
+            if projection_state(occurrence, today, created_month) != "missed"
+        )
         range_start = chunk_end
     return count
 
@@ -468,6 +486,7 @@ async def _project_recurring_items(
     items: list[tuple[TransactionCalendarItem, float]] = []
     deltas: dict[date, float] = {}
     carried_delta = 0.0
+    today = date.today()
     for rec in recurring_rows:
         if rec.account_id is None:
             continue
@@ -489,8 +508,15 @@ async def _project_recurring_items(
         is_transfer = bool(category and category.treat_as_transfer)
         is_ignored = bool(category and category.is_ignored)
         if not is_ignored:
-            carried_delta += _count_occurrences_before(rec, start) * signed_delta
+            carried_delta += (
+                _count_occurrences_before(rec, start, today) * signed_delta
+            )
+        created_month = (
+            rec.created_at.date().replace(day=1) if rec.created_at else None
+        )
         for occ_date in occurrences:
+            if projection_state(occ_date, today, created_month) == "missed":
+                continue
             item = TransactionCalendarItem(
                 kind="projected",
                 recurring_id=rec.id,

@@ -1166,3 +1166,75 @@ async def test_balance_at_multi_currency(session, test_user, test_workspace):
 # ---------------------------------------------------------------------------
 # _total_balance_by_currency
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spending_by_category_carries_group_metadata(
+    session: AsyncSession, test_user, test_workspace
+):
+    """Each row names its group, so the same response can be read per group
+    without a second endpoint. A category without a group keeps nulls, and
+    'Sem categoria' has no group either."""
+    from app.models.category_group import CategoryGroup
+
+    group = CategoryGroup(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        name="Moradia",
+        icon="house",
+        color="#8b5cf6",
+    )
+    session.add(group)
+    await session.commit()
+
+    grouped = await _make_category(session, test_user.id, "Aluguel", color="#F00")
+    grouped.group_id = group.id
+    loose = await _make_category(session, test_user.id, "Avulsa", color="#0F0")
+    await session.commit()
+
+    account = await _make_account(session, test_user.id, "Group Meta")
+    today = date.today()
+    await _add_txn(session, test_user.id, account.id, 100, "debit", today, category_id=grouped.id)
+    await _add_txn(session, test_user.id, account.id, 40, "debit", today, category_id=loose.id)
+    await _add_txn(session, test_user.id, account.id, 10, "debit", today)
+
+    spending = await get_spending_by_category(session, test_workspace.id, test_user.id)
+
+    rent = next(s for s in spending if s.category_id == str(grouped.id))
+    assert rent.group_id == str(group.id)
+    assert rent.group_name == "Moradia"
+    assert rent.group_icon == "house"
+    assert rent.group_color == "#8b5cf6"
+
+    avulsa = next(s for s in spending if s.category_id == str(loose.id))
+    assert avulsa.group_id is None
+
+    uncat = next(s for s in spending if s.category_id is None)
+    assert uncat.group_id is None
+
+
+@pytest.mark.asyncio
+async def test_same_currency_rows_use_their_own_amount(
+    session: AsyncSession, test_user, test_workspace
+):
+    """A 1:1 charge whose amount_primary drifted (the provider reported 83,33
+    on the statement and 83,35 as the account-currency figure) counts by the
+    row's own amount, exactly like the drill-down shows it."""
+    account = await _make_account(session, test_user.id, "Drift")
+    today = date.today().replace(day=min(date.today().day, 28))
+
+    posted = await _add_txn(session, test_user.id, account.id, 100, "debit", today)
+    posted.amount_primary = Decimal("100.02")
+    pending = await _add_txn(session, test_user.id, account.id, 83.33, "debit", today)
+    pending.status = "pending"
+    pending.amount_primary = Decimal("83.35")
+    await session.commit()
+
+    summary = await get_summary(session, test_workspace.id, test_user.id, month=today.replace(day=1))
+
+    # Settled uses the row's amount, not the drifted primary figure.
+    assert summary.monthly_expenses_primary == pytest.approx(100.0)
+    # The pending row rides the forecast with its own amount too, so the
+    # home's "gastará" matches the panel's "total exibido".
+    assert summary.projected_expenses_primary == pytest.approx(183.33)

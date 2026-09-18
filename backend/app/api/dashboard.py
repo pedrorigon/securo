@@ -70,6 +70,7 @@ async def get_projected_transactions(
     account_id: Optional[uuid.UUID] = Query(None),
     from_date: Optional[date] = Query(None, alias="from"),
     to_date: Optional[date] = Query(None, alias="to"),
+    include_missed: bool = Query(False),
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
@@ -82,6 +83,7 @@ async def get_projected_transactions(
             account_id=account_id,
             from_date=from_date,
             to_date=to_date,
+            include_missed=include_missed,
         )
     except ValueError as exc:
         from fastapi import HTTPException

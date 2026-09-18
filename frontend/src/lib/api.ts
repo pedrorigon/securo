@@ -30,6 +30,8 @@ import type {
   InvoiceSettings,
   InvoiceSummary,
   RecurringTransaction,
+  RecurringMatchRule,
+  RecurringMatchRuleInput,
   ProjectedTransaction,
   TransactionCalendarResponse,
   Budget,
@@ -503,6 +505,7 @@ export const transactions = {
     exclude_transfers?: boolean
     user_pnl_only?: boolean
     exclude_ignored?: boolean
+    include_missed?: boolean
     tags?: string[]
     min_amount?: number
     max_amount?: number
@@ -1124,15 +1127,32 @@ export const recurring = {
     const { data } = await api.post('/recurring-transactions/generate')
     return data
   },
+  matchRules: {
+    list: async (): Promise<RecurringMatchRule[]> => {
+      const { data } = await api.get('/recurring-transactions/match-rules')
+      return data
+    },
+    create: async (rule: RecurringMatchRuleInput): Promise<RecurringMatchRule> => {
+      const { data } = await api.post('/recurring-transactions/match-rules', rule)
+      return data
+    },
+    update: async (id: string, rule: RecurringMatchRuleInput): Promise<RecurringMatchRule> => {
+      const { data } = await api.patch(`/recurring-transactions/match-rules/${id}`, rule)
+      return data
+    },
+    delete: async (id: string): Promise<void> => {
+      await api.delete(`/recurring-transactions/match-rules/${id}`)
+    },
+  },
 }
 
 // Budgets
 export const budgets = {
-  list: async (month?: string): Promise<Budget[]> => {
-    const { data } = await api.get('/budgets', { params: { month } })
+  list: async (month?: string, scope?: 'category' | 'group'): Promise<Budget[]> => {
+    const { data } = await api.get('/budgets', { params: { month, scope } })
     return data
   },
-  create: async (budget: { category_id: string; amount: number; month: string; is_recurring?: boolean }): Promise<Budget> => {
+  create: async (budget: { category_id?: string; group_id?: string; amount: number; month: string; is_recurring?: boolean }): Promise<Budget> => {
     const { data } = await api.post('/budgets', budget)
     return data
   },
@@ -1143,8 +1163,8 @@ export const budgets = {
   delete: async (id: string): Promise<void> => {
     await api.delete(`/budgets/${id}`)
   },
-  comparison: async (month?: string): Promise<BudgetVsActual[]> => {
-    const { data } = await api.get('/budgets/comparison', { params: { month } })
+  comparison: async (month?: string, scope?: 'category' | 'group'): Promise<BudgetVsActual[]> => {
+    const { data } = await api.get('/budgets/comparison', { params: { month, scope } })
     return data
   },
 }
@@ -1207,7 +1227,7 @@ export const dashboard = {
     const { data } = await api.get('/dashboard/monthly-trend', { params: { months, ...(extra.params ?? {}) }, ...(extra.paramsSerializer ? { paramsSerializer: extra.paramsSerializer } : {}) })
     return data
   },
-  projectedTransactions: async (params?: { month?: string; account_id?: string; from?: string; to?: string }): Promise<ProjectedTransaction[]> => {
+  projectedTransactions: async (params?: { month?: string; account_id?: string; from?: string; to?: string; include_missed?: boolean }): Promise<ProjectedTransaction[]> => {
     const { data } = await api.get('/dashboard/projected-transactions', { params })
     return data
   },
