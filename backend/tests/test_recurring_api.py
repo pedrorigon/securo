@@ -479,3 +479,80 @@ async def test_weekend_adjustment_update_rejects_null_but_allows_omission(
         row for row in list_response.json() if row["id"] == recurring_id
     )
     assert listed["weekend_adjustment"] == "previous_friday"
+
+
+@pytest.mark.asyncio
+async def test_match_rules_crud_and_validation(client, auth_headers, test_account):
+    """Identification rules: create, list, edit, delete, and the 400s."""
+    create_response = await client.post(
+        "/api/recurring-transactions",
+        json={
+            "description": "Assinatura OpenAI",
+            "amount": 20.00,
+            "currency": "USD",
+            "type": "debit",
+            "frequency": "monthly",
+            "start_date": "2026-09-23",
+            "day_of_month": 23,
+            "account_id": str(test_account.id),
+        },
+        headers=auth_headers,
+    )
+    assert create_response.status_code == 201
+    recurring_id = create_response.json()["id"]
+
+    invalid = await client.post(
+        "/api/recurring-transactions/match-rules",
+        json={"name": "Sem padrões", "patterns": [], "recurring_ids": []},
+        headers=auth_headers,
+    )
+    assert invalid.status_code == 400
+
+    created = await client.post(
+        "/api/recurring-transactions/match-rules",
+        json={
+            "name": "OpenAI",
+            "patterns": ["OpenAI", "openai"],
+            "excludes": ["IOF"],
+            "recurring_ids": [recurring_id],
+        },
+        headers=auth_headers,
+    )
+    assert created.status_code == 201
+    rule = created.json()
+    assert rule["name"] == "OpenAI"
+    assert rule["patterns"] == ["openai"]
+    assert rule["excludes"] == ["iof"]
+    assert rule["recurring_ids"] == [recurring_id]
+
+    listed = await client.get(
+        "/api/recurring-transactions/match-rules", headers=auth_headers
+    )
+    assert listed.status_code == 200
+    assert [row["id"] for row in listed.json()] == [rule["id"]]
+
+    updated = await client.patch(
+        f"/api/recurring-transactions/match-rules/{rule['id']}",
+        json={"name": "OpenAI (Claude incluído)", "patterns": ["openai", "anthropic"]},
+        headers=auth_headers,
+    )
+    assert updated.status_code == 200
+    assert updated.json()["patterns"] == ["openai", "anthropic"]
+    assert updated.json()["recurring_ids"] == [recurring_id]
+
+    deleted = await client.delete(
+        f"/api/recurring-transactions/match-rules/{rule['id']}",
+        headers=auth_headers,
+    )
+    assert deleted.status_code == 204
+    after = await client.get(
+        "/api/recurring-transactions/match-rules", headers=auth_headers
+    )
+    assert after.json() == []
+
+    missing = await client.patch(
+        "/api/recurring-transactions/match-rules/00000000-0000-0000-0000-000000000000",
+        json={"name": "x"},
+        headers=auth_headers,
+    )
+    assert missing.status_code == 404

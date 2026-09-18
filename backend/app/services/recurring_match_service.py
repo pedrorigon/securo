@@ -35,12 +35,17 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.account import Account
 from app.models.recurring_transaction import RecurringTransaction
 from app.models.transaction import Transaction
-from app.services import reconciliation_policy, reconciliation_rule_service
+from app.services import (
+    reconciliation_policy,
+    reconciliation_rule_service,
+    recurring_match_rule_service,
+)
 from app.services.reconciliation_engine import Expectation, Movement, evaluate
 
 # Real-transaction sources a recurring charge can arrive under. Excludes
@@ -53,6 +58,21 @@ _REAL_SOURCES = ("sync", "ofx", "csv", "manual")
 #: the exact window would silently re-implement the rule in a second place,
 #: and the two would drift.
 _QUERY_WINDOW_DAYS = 5
+
+
+def _month_bounds(when: date) -> tuple[date, date]:
+    """First day of the month and first day of the next, half-open."""
+    start = when.replace(day=1)
+    end = (start + timedelta(days=32)).replace(day=1)
+    return start, end
+
+
+async def _workspace_for_account(
+    session: AsyncSession, account_id: uuid.UUID
+) -> Optional[uuid.UUID]:
+    return await session.scalar(
+        select(Account.workspace_id).where(Account.id == account_id)
+    )
 
 
 def _as_movement(transaction: Transaction) -> Movement:
@@ -118,6 +138,78 @@ def _best_movement(
     return best
 
 
+async def _rule_real_tx_for_occurrence(
+    session: AsyncSession,
+    recurring: RecurringTransaction,
+    occurrence_date: date,
+) -> Optional[Transaction]:
+    """A real charge the workspace's rules identify as this occurrence's.
+
+    Same idea as the placeholder lookup, seen from the other side: the charge
+    is already in the ledger and the occurrence is about to be generated, so
+    the rule decides whether writing a placeholder would be writing a
+    duplicate. The month is the window; the closest charge wins, earliest
+    first on a tie.
+    """
+    rules = await recurring_match_rule_service.load_rules(
+        session, recurring.workspace_id
+    )
+    if not rules:
+        return None
+    scoped = recurring_match_rule_service.rules_for_recurring(rules, recurring.id)
+    if not scoped:
+        return None
+
+    locations = {(recurring.account_id, recurring.type)}
+    for rule in scoped:
+        locations.add(rule.search_location(recurring.account_id, recurring.type))
+    locations.discard((None, None))
+    if not locations:
+        return None
+
+    month_start, month_end = _month_bounds(occurrence_date)
+    result = await session.execute(
+        select(Transaction).where(
+            Transaction.recurring_transaction_id.is_(None),
+            Transaction.source.in_(_REAL_SOURCES),
+            Transaction.date >= month_start,
+            Transaction.date < month_end,
+            or_(
+                *[
+                    and_(Transaction.account_id == account, Transaction.type == ttype)
+                    for account, ttype in locations
+                    if account is not None
+                ]
+            ),
+        ).order_by(Transaction.date.asc())
+    )
+
+    best: Optional[Transaction] = None
+    best_key: Optional[tuple[int, date]] = None
+    for candidate in result.scalars():
+        if candidate.is_ignored:
+            continue
+        accepted = False
+        for rule in scoped:
+            if rule.accumulate:
+                continue
+            if not rule.matches_transaction(candidate):
+                continue
+            if rule.search_location(recurring.account_id, recurring.type) == (
+                candidate.account_id,
+                candidate.type,
+            ):
+                accepted = True
+                break
+        if not accepted:
+            continue
+        key = (abs((candidate.date - occurrence_date).days), candidate.date)
+        if best_key is None or key < best_key:
+            best_key = key
+            best = candidate
+    return best
+
+
 async def find_real_tx_for_occurrence(
     session: AsyncSession,
     recurring: RecurringTransaction,
@@ -128,6 +220,10 @@ async def find_real_tx_for_occurrence(
     Used by generate_pending: instead of writing a duplicate placeholder for an
     occurrence a real charge already covers, link that charge to the bill.
     """
+    via_rule = await _rule_real_tx_for_occurrence(session, recurring, occurrence_date)
+    if via_rule is not None:
+        return via_rule
+
     policy = await reconciliation_rule_service.resolve_recurring(
         session, recurring.workspace_id, recurring.frequency
     )
@@ -148,6 +244,136 @@ async def find_real_tx_for_occurrence(
     )
 
 
+async def _rule_placeholder_for_incoming(
+    session: AsyncSession,
+    account_id: uuid.UUID,
+    amount: Decimal,
+    currency: str,
+    tx_type: str,
+    tx_date: date,
+    description: Optional[str],
+    payee: Optional[str] = None,
+    payee_id: Optional[uuid.UUID] = None,
+) -> Optional[Transaction]:
+    """The placeholder a workspace's identification rule says this charge answers.
+
+    Unlike the policy path, amount and currency are deliberately not compared:
+    a subscription billed in dollars posts in reais with IOF on top, and only
+    the rule's text says the two rows are the same promise. The whole month of
+    the placeholder is the window; the charge's date only ranks candidates, and
+    the earliest placeholder breaks a tie.
+
+    Marks the winner with ``_matched_by_rule`` so the caller knows to fold the
+    charge's own numbers into it — the policy path never needs that, because it
+    only ever pairs rows that already agree.
+    """
+    if not description:
+        return None
+    # Compared in Python below, where a string would make every check false.
+    account_id = uuid.UUID(str(account_id))
+    workspace_id = await _workspace_for_account(session, account_id)
+    if workspace_id is None:
+        return None
+    rules = await recurring_match_rule_service.load_rules(session, workspace_id)
+    if not rules:
+        return None
+
+    # A transient stand-in for the charge, so a rule borrowed from the Rules
+    # screen can be evaluated against exactly what arrived (its conditions
+    # may look at the type, the account or the date, not only the text).
+    incoming = Transaction(
+        workspace_id=workspace_id,
+        account_id=account_id,
+        description=description,
+        amount=Decimal(amount or 0),
+        currency=currency,
+        type=tx_type,
+        date=tx_date,
+        payee=payee,
+        payee_id=payee_id,
+    )
+
+    month_start, month_end = _month_bounds(tx_date)
+    result = await session.execute(
+        select(Transaction).where(
+            Transaction.workspace_id == workspace_id,
+            Transaction.source == "recurring",
+            Transaction.external_id.is_(None),
+            Transaction.date >= month_start,
+            Transaction.date < month_end,
+        ).order_by(Transaction.date.asc())
+    )
+
+    best: Optional[Transaction] = None
+    best_key: Optional[tuple[int, date]] = None
+    for candidate in result.scalars():
+        if candidate.is_ignored or candidate.recurring_transaction_id is None:
+            continue
+        scoped = recurring_match_rule_service.rules_for_recurring(
+            rules, candidate.recurring_transaction_id
+        )
+        accepted = False
+        for rule in scoped:
+            if rule.accumulate:
+                # A bill settled in pieces is judged by its month in the
+                # bill path; no single charge may claim a placeholder for it.
+                continue
+            if not rule.matches_transaction(incoming):
+                continue
+            # The placeholder is where the bill sits; the rule may point the
+            # settling charge somewhere else (other account, other direction).
+            if rule.search_location(candidate.account_id, candidate.type) == (
+                account_id,
+                tx_type,
+            ):
+                accepted = True
+                break
+        if not accepted:
+            continue
+        key = (abs((candidate.date - tx_date).days), candidate.date)
+        if best_key is None or key < best_key:
+            best_key = key
+            best = candidate
+    if best is not None:
+        # Transient marker, read by the caller through `matched_by_rule`.
+        # A column would need a migration for a fact that lives and dies
+        # with one import batch.
+        setattr(best, "_matched_by_rule", True)
+    return best
+
+
+def matched_by_rule(placeholder: Transaction) -> bool:
+    """Whether this placeholder won its match through an identification rule.
+
+    A rule match promises nothing about the amount, so the caller must fold
+    the real charge's own numbers in; a policy match already agrees on them
+    and must not be touched.
+    """
+    return bool(getattr(placeholder, "_matched_by_rule", False))
+
+
+def absorb_real_charge(placeholder: Transaction, incoming: Transaction) -> None:
+    """Fold a rule-matched charge's own numbers into the placeholder it fulfilled.
+
+    The policy path never needs this: it only links rows that already agree on
+    amount and currency, so copying them would be a no-op. A rule promises the
+    opposite — the text identifies the charge, whatever it costs — so the
+    placeholder adopts what the bank actually said (amount, currency, date and
+    the bill that date falls in) while keeping the row, and the recurring link,
+    the person already sees. Only called for a rule match; the category and
+    payee the placeholder already had stay put.
+    """
+    placeholder.amount = incoming.amount
+    placeholder.currency = incoming.currency
+    placeholder.date = incoming.date
+    placeholder.effective_date = incoming.effective_date
+    placeholder.bill_id = incoming.bill_id
+    if incoming.fx_rate_used is not None:
+        placeholder.fx_rate_used = incoming.fx_rate_used
+    if incoming.amount_primary is not None:
+        placeholder.amount_primary = incoming.amount_primary
+
+
 async def find_placeholder_for_incoming(
     session: AsyncSession,
     account_id: uuid.UUID,
@@ -156,6 +382,8 @@ async def find_placeholder_for_incoming(
     tx_type: str,
     tx_date: date,
     description: Optional[str],
+    payee: Optional[str] = None,
+    payee_id: Optional[uuid.UUID] = None,
 ) -> Optional[Transaction]:
     """Find an unmatched generated placeholder this incoming charge fulfills.
 
@@ -168,7 +396,17 @@ async def find_placeholder_for_incoming(
     placeholder is scored against it. The window is symmetric here: a
     placeholder was written for one specific occurrence, so unlike a bill it has
     no neighbour to be confused with.
+
+    A workspace's identification rules are asked first, because when somebody
+    has written down what the charge looks like that answer beats a heuristic.
     """
+    via_rule = await _rule_placeholder_for_incoming(
+        session, account_id, amount, currency, tx_type, tx_date, description,
+        payee, payee_id,
+    )
+    if via_rule is not None:
+        return via_rule
+
     policy = reconciliation_policy.default_policy("reconciliation.match_placeholder")
     result = await session.execute(
         select(Transaction).where(
@@ -196,6 +434,139 @@ async def find_placeholder_for_incoming(
     return _best_movement(result.scalars(), incoming, policy)
 
 
+async def _rule_bill_for_incoming(
+    session: AsyncSession,
+    account_id: uuid.UUID,
+    amount: Decimal,
+    currency: str,
+    tx_type: str,
+    tx_date: date,
+    description: Optional[str],
+    payee: Optional[str] = None,
+    payee_id: Optional[uuid.UUID] = None,
+) -> Optional[RecurringTransaction]:
+    """An active bill whose occurrence this charge fulfills, per the rules.
+
+    The charge and the bill are on the same account and go the same direction,
+    the rule's text identifies the charge, and the occurrence must fall in the
+    charge's month. Amount and currency are not compared on purpose (the bill
+    is a forecast; the charge is the fact). The occurrence closest to the
+    charge wins; the earliest breaks a tie.
+    """
+    from app.services.recurring_transaction_service import get_occurrences_in_range
+
+    if not description:
+        return None
+    # The account is compared in Python below (a rule may point the settling
+    # charge somewhere else), so a caller handing us a string must not make
+    # every comparison quietly false.
+    account_id = uuid.UUID(str(account_id))
+    workspace_id = await _workspace_for_account(session, account_id)
+    if workspace_id is None:
+        return None
+    rules = await recurring_match_rule_service.load_rules(session, workspace_id)
+    if not rules:
+        return None
+
+    incoming = Transaction(
+        workspace_id=workspace_id,
+        account_id=account_id,
+        description=description,
+        amount=Decimal(amount or 0),
+        currency=currency,
+        type=tx_type,
+        date=tx_date,
+        payee=payee,
+        payee_id=payee_id,
+    )
+    matching = [
+        rule
+        for rule in rules
+        if rule.recurring_ids and rule.matches_transaction(incoming)
+    ]
+    if not matching:
+        return None
+    candidate_ids = set().union(*(rule.recurring_ids for rule in matching))
+
+    result = await session.execute(
+        select(RecurringTransaction).where(
+            RecurringTransaction.id.in_(candidate_ids),
+            RecurringTransaction.is_active.is_(True),
+        )
+    )
+
+    month_start, month_end = _month_bounds(tx_date)
+
+    # A bill settled in pieces is judged by its month, not by one charge: the
+    # total of everything the rule identifies counts toward the line, and the
+    # charge that crosses it is the one that settles the occurrence.
+    rule_totals: dict[uuid.UUID, Decimal] = {}
+
+    async def month_total(rule) -> Decimal:
+        cached = rule_totals.get(rule.id)
+        if cached is not None:
+            return cached
+        search_account, search_type = rule.search_location(account_id, tx_type)
+        stmt = select(Transaction).where(
+            Transaction.source.in_(_REAL_SOURCES),
+            Transaction.date >= month_start,
+            Transaction.date < month_end,
+        )
+        if search_account is not None:
+            stmt = stmt.where(Transaction.account_id == search_account)
+        if search_type is not None:
+            stmt = stmt.where(Transaction.type == search_type)
+        total = Decimal(incoming.amount or 0)
+        for row in (await session.execute(stmt)).scalars():
+            if row.is_ignored:
+                continue
+            if rule.matches_transaction(row):
+                total += Decimal(row.amount or 0)
+        rule_totals[rule.id] = total
+        return total
+
+    best: Optional[RecurringTransaction] = None
+    best_key: Optional[tuple[int, date]] = None
+    for recurring in result.scalars():
+        # The charge lands where this rule says it lands: the bill's own
+        # account and direction normally, or wherever the rule points when it
+        # names a different location (the PIX credit on the investment side).
+        accepted = False
+        for rule in matching:
+            if recurring.id not in rule.recurring_ids:
+                continue
+            if rule.search_location(recurring.account_id, recurring.type) != (
+                account_id,
+                tx_type,
+            ):
+                continue
+            if rule.accumulate:
+                required = rule.accumulate_threshold or Decimal(
+                    recurring.amount or 0
+                )
+                if required > 0 and await month_total(rule) < required:
+                    continue
+            accepted = True
+            break
+        if not accepted:
+            continue
+        occurrences = get_occurrences_in_range(
+            start=recurring.next_occurrence,
+            frequency=recurring.frequency,
+            end_date=recurring.end_date,
+            range_start=month_start,
+            range_end=month_end,
+            intended_day=recurring.day_of_month or recurring.start_date.day,
+            weekend_adjustment=recurring.weekend_adjustment,
+        )
+        for occurrence in occurrences:
+            key = (abs((occurrence - tx_date).days), occurrence)
+            if best_key is None or key < best_key:
+                best_key = key
+                best = recurring
+    return best
+
+
 async def find_bill_for_incoming(
     session: AsyncSession,
     user_id: uuid.UUID,
@@ -205,6 +576,8 @@ async def find_bill_for_incoming(
     tx_type: str,
     tx_date: date,
     description: Optional[str],
+    payee: Optional[str] = None,
+    payee_id: Optional[uuid.UUID] = None,
 ) -> Optional[RecurringTransaction]:
     """Find an active bill whose next expected occurrence this charge fulfills.
 
@@ -215,7 +588,19 @@ async def find_bill_for_incoming(
     The one lookup shaped the way the engine natively is (one movement, many
     promises), except that each bill carries its own window, so each is asked
     under its own policy rather than all of them under one.
+
+    A workspace's identification rules are asked first: when somebody has
+    written down what the charge looks like, that answer beats a heuristic,
+    and it is the only path that tolerates the amount and currency a
+    cross-border subscription changes on the way in.
     """
+    via_rule = await _rule_bill_for_incoming(
+        session, account_id, amount, currency, tx_type, tx_date, description,
+        payee, payee_id,
+    )
+    if via_rule is not None:
+        return via_rule
+
     from app.services.recurring_transaction_service import adjust_weekend_date
 
     result = await session.execute(

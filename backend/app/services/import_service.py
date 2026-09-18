@@ -868,8 +868,21 @@ async def import_transactions(
             txn_data.type,
             txn_data.date,
             preview.description,
+            preview.payee or import_payee_raw,
+            preview.payee_id or import_payee_id,
         )
         if placeholder and not placeholder.is_ignored:
+            # A rule match made no promise about the amount, so the real charge
+            # brings its own numbers (a subscription billed in dollars posts in
+            # reais). The policy path only pairs rows that already agree, so
+            # there it would be a no-op and is skipped.
+            if recurring_match_service.matched_by_rule(placeholder):
+                recurring_match_service.absorb_real_charge(placeholder, incoming)
+                if txn_data.fx_rate:
+                    placeholder.fx_rate_used = txn_data.fx_rate
+                    placeholder.amount_primary = txn_data.amount * txn_data.fx_rate
+                else:
+                    await stamp_primary_amount(session, user_id, placeholder)
             placeholder.source = source
             placeholder.external_id = txn_data.external_id
             placeholder.import_id = import_log.id
@@ -903,6 +916,8 @@ async def import_transactions(
             txn_data.type,
             txn_data.date,
             preview.description,
+            preview.payee or import_payee_raw,
+            preview.payee_id or import_payee_id,
         )
         incoming.recurring_transaction_id = (
             recurring_link.id if recurring_link else None

@@ -9,14 +9,128 @@ from app.core.workspace_context import (
     current_workspace,
     current_writable_workspace,
 )
+from app.schemas.recurring_match_rule import (
+    RecurringMatchRuleCreate,
+    RecurringMatchRuleRead,
+    RecurringMatchRuleUpdate,
+    match_rule_read,
+)
 from app.schemas.recurring_transaction import (
     RecurringTransactionCreate,
     RecurringTransactionRead,
     RecurringTransactionUpdate,
 )
-from app.services import recurring_transaction_service
+from app.services import (
+    recurring_match_rule_service,
+    recurring_transaction_service,
+)
 
 router = APIRouter(prefix="/api/recurring-transactions", tags=["recurring-transactions"])
+
+
+# ---------------------------------------------------------------------------
+# Identification rules. Declared before the ``/{recurring_id}`` routes so the
+# literal "match-rules" path is never parsed as an id.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/match-rules", response_model=list[RecurringMatchRuleRead])
+async def list_match_rules(
+    ctx: WorkspaceContext = Depends(current_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    rows = await recurring_match_rule_service.list_rules(session, ctx.workspace.id)
+    names = await recurring_match_rule_service.source_rule_names(session, rows)
+    return [
+        match_rule_read(
+            row,
+            source_rule_name=names.get(
+                str((row.config or {}).get("source_rule_id", ""))
+            ),
+        )
+        for row in rows
+    ]
+
+
+@router.post(
+    "/match-rules",
+    response_model=RecurringMatchRuleRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_match_rule(
+    data: RecurringMatchRuleCreate,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    try:
+        row = await recurring_match_rule_service.create_rule(
+            session,
+            ctx.workspace.id,
+            ctx.user_id,
+            data.name,
+            data.patterns,
+            data.excludes,
+            data.recurring_ids,
+            data.source_rule_id,
+            data.search_account_id,
+            data.search_type,
+            data.accumulate,
+            data.accumulate_threshold,
+        )
+    except recurring_match_rule_service.RuleError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=e.code) from e
+    await session.commit()
+    names = await recurring_match_rule_service.source_rule_names(session, [row])
+    return match_rule_read(
+        row, source_rule_name=names.get(str((row.config or {}).get("source_rule_id", "")))
+    )
+
+
+@router.patch("/match-rules/{rule_id}", response_model=RecurringMatchRuleRead)
+async def update_match_rule(
+    rule_id: uuid.UUID,
+    data: RecurringMatchRuleUpdate,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    row = await recurring_match_rule_service.get_rule(session, ctx.workspace.id, rule_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule not found")
+    try:
+        row = await recurring_match_rule_service.update_rule(
+            session,
+            ctx.workspace.id,
+            row,
+            name=data.name,
+            patterns=data.patterns,
+            excludes=data.excludes,
+            recurring_ids=data.recurring_ids,
+            source_rule_id=data.source_rule_id,
+            search_account_id=data.search_account_id,
+            search_type=data.search_type,
+            accumulate=data.accumulate,
+            accumulate_threshold=data.accumulate_threshold,
+        )
+    except recurring_match_rule_service.RuleError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=e.code) from e
+    await session.commit()
+    names = await recurring_match_rule_service.source_rule_names(session, [row])
+    return match_rule_read(
+        row, source_rule_name=names.get(str((row.config or {}).get("source_rule_id", "")))
+    )
+
+
+@router.delete("/match-rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_match_rule(
+    rule_id: uuid.UUID,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    row = await recurring_match_rule_service.get_rule(session, ctx.workspace.id, rule_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule not found")
+    row.deleted = True
+    await session.commit()
 
 
 @router.get("", response_model=list[RecurringTransactionRead])

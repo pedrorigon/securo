@@ -2695,11 +2695,36 @@ async def sync_connection(
                         txn_data.type,
                         txn_data.date,
                         preview.description,
+                        preview.payee or txn_data.payee,
+                        preview.payee_id or sync_payee_id,
                     )
                 )
                 if placeholder:
                     if placeholder.is_ignored:
                         continue
+                    # A rule match made no promise about the amount, so the real
+                    # charge brings its own numbers (a subscription billed in
+                    # dollars posts in reais). The policy path only pairs rows
+                    # that already agree, so there it is skipped.
+                    if recurring_match_service.matched_by_rule(placeholder):
+                        recurring_match_service.absorb_real_charge(
+                            placeholder, transaction
+                        )
+                        acct_currency = acc_data.currency or user_currency
+                        if (
+                            txn_data.amount_in_account_currency is not None
+                            and txn_data.amount
+                            and acct_currency == user_currency
+                            and txn_data.currency != acct_currency
+                        ):
+                            placeholder.amount_primary = (
+                                txn_data.amount_in_account_currency
+                            )
+                            placeholder.fx_rate_used = (
+                                txn_data.amount_in_account_currency / txn_data.amount
+                            )
+                        else:
+                            await stamp_primary_amount(session, user_id, placeholder)
                     placeholder.external_id = txn_data.external_id
                     placeholder.source = "sync"
                     placeholder.status = txn_data.status
@@ -2735,6 +2760,8 @@ async def sync_connection(
                         txn_data.type,
                         txn_data.date,
                         preview.description,
+                        preview.payee or txn_data.payee,
+                        preview.payee_id or sync_payee_id,
                     )
                 )
                 transaction.recurring_transaction_id = (
