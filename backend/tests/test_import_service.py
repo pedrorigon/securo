@@ -2047,13 +2047,171 @@ class TestOfxInstallmentDedup:
         )
         await import_transactions(session, test_workspace.id, test_user.id, test_account.id, [txn], "ofx")
         imported, skipped, _, _ = await import_transactions(
-            session, test_workspace.id, test_user.id, test_account.id, [txn], "ofx",
+            session,
+            test_workspace.id,
+            test_user.id,
+            test_account.id,
+            [txn, txn.model_copy()],
+            "ofx",
         )
         assert imported == 0
-        assert skipped == 1
+        assert skipped == 2
+
+
+    @pytest.mark.asyncio
+    async def test_same_external_id_same_date_different_amounts_all_imported(
+        self, session: AsyncSession, test_user: User, test_workspace, test_account: Account,
+    ):
+        """Some banks reuse one FITID for several entries on the same day
+        (issue #911). Each distinct amount must be imported, and re-importing
+        the same file must still skip all of them."""
+        from app.schemas.transaction import TransactionImport
+
+        rows = [
+            TransactionImport(
+                description=memo,
+                amount=Decimal(amount),
+                date=date(2026, 7, 1),
+                type="credit",
+                external_id="101.820.900.050.894",
+            )
+            for memo, amount in [
+                ("Rende Facil 1", "1.72"),
+                ("Rende Facil 2", "3.04"),
+                ("Rende Facil 3", "2.85"),
+            ]
+        ]
+        imported, skipped, _, _ = await import_transactions(
+            session, test_workspace.id, test_user.id, test_account.id, rows, "ofx",
+        )
+        assert imported == 3
+        assert skipped == 0
+
+        imported2, skipped2, _, _ = await import_transactions(
+            session,
+            test_workspace.id,
+            test_user.id,
+            test_account.id,
+            [r.model_copy() for r in rows],
+            "ofx",
+        )
+        assert imported2 == 0
+        assert skipped2 == 3
 
 
 class TestCsvDuplicateDetectionToggle:
+    @pytest.mark.asyncio
+    async def test_csv_identical_new_rows_remain_distinct(
+        self, session: AsyncSession, test_user: User, test_workspace, test_account: Account,
+    ):
+        from app.schemas.transaction import TransactionImport
+
+        row = TransactionImport(
+            description="Coffee Shop",
+            amount=Decimal("8.50"),
+            date=date(2026, 6, 15),
+            type="debit",
+        )
+        imported, skipped, _, _ = await import_transactions(
+            session,
+            test_workspace.id,
+            test_user.id,
+            test_account.id,
+            [row, row.model_copy()],
+            "csv",
+        )
+
+        assert (imported, skipped) == (2, 0)
+
+    @pytest.mark.asyncio
+    async def test_csv_exact_match_consumes_one_synced_row_once(
+        self, session: AsyncSession, test_user: User, test_workspace, test_account: Account,
+    ):
+        from app.models.transaction import Transaction
+        from app.schemas.transaction import TransactionImport
+
+        session.add(Transaction(
+            id=uuid.uuid4(),
+            user_id=test_user.id,
+            workspace_id=test_workspace.id,
+            account_id=test_account.id,
+            external_id="provider-coffee",
+            description="Coffee Shop",
+            amount=Decimal("8.50"),
+            date=date(2026, 6, 15),
+            type="debit",
+            source="sync",
+            status="posted",
+        ))
+        await session.commit()
+
+        row = TransactionImport(
+            description="Coffee Shop",
+            amount=Decimal("8.50"),
+            date=date(2026, 6, 15),
+            type="debit",
+        )
+        imported, skipped, _, _ = await import_transactions(
+            session,
+            test_workspace.id,
+            test_user.id,
+            test_account.id,
+            [row, row.model_copy()],
+            "csv",
+        )
+
+        assert (imported, skipped) == (1, 1)
+
+    @pytest.mark.asyncio
+    async def test_csv_payee_match_consumes_one_synced_row_once(
+        self, session: AsyncSession, test_user: User, test_workspace, test_account: Account,
+    ):
+        from app.models.transaction import Transaction
+        from app.schemas.transaction import TransactionImport
+
+        synced = Transaction(
+            id=uuid.uuid4(),
+            user_id=test_user.id,
+            workspace_id=test_workspace.id,
+            account_id=test_account.id,
+            external_id="provider-spotify",
+            description="SPOTIFY USA 45 W. 18TH STREET NEW YORK",
+            payee="Spotify",
+            amount=Decimal("12.99"),
+            date=date(2026, 6, 15),
+            type="debit",
+            source="sync",
+            status="posted",
+        )
+        session.add(synced)
+        await session.commit()
+
+        imported, skipped, _, _ = await import_transactions(
+            session,
+            test_workspace.id,
+            test_user.id,
+            test_account.id,
+            [
+                TransactionImport(
+                    description="Spotify",
+                    payee_raw="Spotify",
+                    amount=Decimal("12.99"),
+                    date=date(2026, 6, 16),
+                    type="debit",
+                ),
+                TransactionImport(
+                    description="Spotify",
+                    payee_raw="Spotify",
+                    amount=Decimal("12.99"),
+                    date=date(2026, 6, 16),
+                    type="debit",
+                ),
+            ],
+            "csv",
+        )
+
+        assert (imported, skipped) == (1, 1)
+
     @pytest.mark.asyncio
     async def test_csv_detect_duplicates_false_allows_duplicates(
         self, session: AsyncSession, test_user: User, test_workspace, test_account: Account,
@@ -2513,6 +2671,48 @@ async def test_import_tolerates_duplicate_external_id_rows(
     assert len(remaining) == 2
 
 
+@pytest.mark.asyncio
+async def test_import_external_id_reconciles_matching_synced_transaction(
+    session: AsyncSession, test_user: User, test_workspace, test_account: Account,
+):
+    from app.models.transaction import Transaction
+    from app.schemas.transaction import TransactionImport
+
+    session.add(Transaction(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        account_id=test_account.id,
+        external_id="provider-id",
+        description="Music subscription",
+        original_description="SPOTIFY",
+        amount=Decimal("23.90"),
+        date=date(2026, 1, 15),
+        type="debit",
+        source="sync",
+    ))
+    await session.commit()
+
+    imported, skipped, _, _ = await import_transactions(
+        session,
+        test_workspace.id,
+        test_user.id,
+        test_account.id,
+        [TransactionImport(
+            external_id="ofx-fitid",
+            description="SPOTIFY",
+            amount=Decimal("23.90"),
+            date=date(2026, 1, 15),
+            type="debit",
+        )],
+        "ofx",
+        detected_format="ofx",
+    )
+
+    assert imported == 0
+    assert skipped == 1
+
+
 def test_normalize_amount_swiss_single_quotes():
     from app.services.import_service import normalize_amount
     assert normalize_amount("1'050.45") == "1050.45"
@@ -2569,3 +2769,127 @@ def test_parse_csv_reports_short_rows_instead_of_raising():
     assert failed_rows[2].line_number == 5
     assert failed_rows[2].error_reason == "invalid_date"
     assert failed_rows[2].raw_value == "invalid_date"
+
+
+def test_parse_csv_comma_thousands_inferred_per_column():
+    from app.services.import_service import parse_csv
+    csv_content = (
+        "Date,Transaction Type,Amount,Description\n"
+        '2026-08-01,Credit,"375,000.00",SALARY\n'
+        '2026-08-02,Debit,"25,000",TRANSFER\n'
+        '2026-08-03,DEBIT,"1,500.50",AIRTIME\n'
+        '2026-08-05,debit,"3,000",POS\n'
+    )
+    transactions, failed_rows = parse_csv(csv_content.encode("utf-8"))
+
+    assert failed_rows == []
+    assert [t.amount for t in transactions] == [
+        Decimal("375000.00"), Decimal("25000"), Decimal("1500.50"), Decimal("3000"),
+    ]
+    assert [t.type for t in transactions] == ["credit", "debit", "debit", "debit"]
+
+
+def test_parse_csv_comma_thousands_only_column():
+    from app.services.import_service import parse_csv
+    csv_content = (
+        "date,description,amount\n"
+        '2026-08-02,Transfer,"-25,000"\n'
+        '2026-08-03,Salary,"1,234,567"\n'
+    )
+    transactions, _ = parse_csv(csv_content.encode("utf-8"))
+    assert [t.amount for t in transactions] == [Decimal("25000"), Decimal("1234567")]
+    assert [t.type for t in transactions] == ["debit", "credit"]
+
+
+def test_parse_csv_brazilian_column_still_parses():
+    from app.services.import_service import parse_csv
+    csv_content = (
+        "data;descricao;valor\n"
+        "01/08/2026;Mercado;-1.234,56\n"
+        "02/08/2026;Padaria;-12,50\n"
+        "03/08/2026;Aluguel;-2.000\n"
+    )
+    transactions, _ = parse_csv(csv_content.encode("utf-8"))
+    assert [t.amount for t in transactions] == [
+        Decimal("1234.56"), Decimal("12.50"), Decimal("2000"),
+    ]
+    assert all(t.type == "debit" for t in transactions)
+
+
+def test_parse_csv_zero_comma_is_decimal():
+    from app.services.import_service import parse_csv
+    csv_content = 'date,description,amount\n2026-08-01,Fee,"0,125"\n'
+    transactions, _ = parse_csv(csv_content.encode("utf-8"))
+    assert transactions[0].amount == Decimal("0.125")
+
+
+def test_parse_csv_strips_currency_symbols_and_codes():
+    from app.services.import_service import parse_csv
+    csv_content = (
+        "date,description,amount\n"
+        "2026-08-01,A,$40.00\n"
+        "2026-08-02,B,NGN 2300.50\n"
+        "2026-08-03,C,USD 10\n"
+        "2026-08-04,D,-₦1500.00\n"
+    )
+    transactions, failed_rows = parse_csv(csv_content.encode("utf-8"))
+    assert failed_rows == []
+    assert [t.amount for t in transactions] == [
+        Decimal("40.00"), Decimal("2300.50"), Decimal("10"), Decimal("1500.00"),
+    ]
+    assert transactions[3].type == "debit"
+
+
+def test_normalize_amount_currency_and_separators():
+    from app.services.import_service import normalize_amount
+    assert normalize_amount("$40.00") == "40.00"
+    assert normalize_amount("€12,50") == "12.50"
+    assert normalize_amount("NGN 2,300.50") == "2300.50"
+    assert normalize_amount("₦1,500.00") == "1500.00"
+    assert normalize_amount("USD 10") == "10"
+    assert normalize_amount("12,50 EUR") == "12.50"
+    assert normalize_amount("R$ 1.234,56") == "1234.56"
+    assert normalize_amount("-$40.00") == "-40.00"
+    assert normalize_amount("(12.50)") == "-12.50"
+    assert normalize_amount("25,000", ".") == "25000"
+    assert normalize_amount("0,125", ".") == "0.125"
+    assert normalize_amount("1.234", ",") == "1234"
+    # Without a column hint the per-cell behaviour is unchanged.
+    assert normalize_amount("0,125") == "0.125"
+    assert normalize_amount("12,50") == "12.50"
+
+
+def test_infer_decimal_separator():
+    from app.services.import_service import infer_decimal_separator
+    assert infer_decimal_separator(["25,000", "1,500.50"]) == "."
+    assert infer_decimal_separator(["1.234,56", "12,50"]) == ","
+    assert infer_decimal_separator(["25,000", "3,000"]) == "."
+    assert infer_decimal_separator(["0,125"]) is None
+    assert infer_decimal_separator(["10", ""]) is None
+
+
+def test_parse_csv_dr_cr_and_unicode_minus_keep_the_sign():
+    from app.services.import_service import parse_csv
+    csv_content = (
+        "date,description,amount\n"
+        "2026-08-01,Card,100.00 DR\n"
+        "2026-08-02,Refund,50.00 CR\n"
+        "2026-08-03,Fee,\u221240.00\n"
+        "2026-08-04,Costa Rica,CRC 10.00\n"
+    )
+    transactions, failed_rows = parse_csv(csv_content.encode("utf-8"))
+    assert failed_rows == []
+    assert [(t.type, t.amount) for t in transactions] == [
+        ("debit", Decimal("100.00")),
+        ("credit", Decimal("50.00")),
+        ("debit", Decimal("40.00")),
+        ("credit", Decimal("10.00")),
+    ]
+
+
+def test_normalize_amount_dr_cr_markers():
+    from app.services.import_service import normalize_amount
+    assert normalize_amount("1,234.56DR") == "-1234.56"
+    assert normalize_amount("-10.00 CR") == "10.00"
+    assert normalize_amount("10.00 XDR") == "10.00"
+    assert normalize_amount("\u20131.50") == "-1.50"

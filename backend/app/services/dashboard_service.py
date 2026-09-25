@@ -7,6 +7,7 @@ from sqlalchemy import select, func, case, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.app_clock import app_today
 from app.core.config import get_settings
 from app.models.account import Account
 from app.models.bank_connection import BankConnection
@@ -221,7 +222,7 @@ async def _get_forecast_transactions(
     if account_ids is not None and len(account_ids) == 0:
         return []
 
-    today = date.today()
+    today = app_today()
     bucket_date = range_date_col if range_date_col is not None else Transaction.date
     stmt = (
         select(Transaction)
@@ -282,10 +283,10 @@ async def get_summary(
     asset_group_ids: Optional[list[uuid.UUID]] = None,
 ) -> DashboardSummary:
     if not month:
-        month = date.today().replace(day=1)
+        month = app_today().replace(day=1)
 
     month_start, month_end = _month_range(month)
-    today = date.today()
+    today = app_today()
 
     # Collection filter (issue #105): show the *raw* P&L/balances of the
     # collection's accounts, plus the assets in its wallets (asset_group_ids);
@@ -810,10 +811,10 @@ async def get_spending_by_category(
     account_ids: Optional[list[uuid.UUID]] = None,
 ) -> list[SpendingByCategory]:
     if not month:
-        month = date.today().replace(day=1)
+        month = app_today().replace(day=1)
 
     month_start, month_end = _month_range(month)
-    today = date.today()
+    today = app_today()
     filtered = account_ids is not None
     acct_filter = [Transaction.account_id.in_(account_ids)] if filtered else []
 
@@ -1059,7 +1060,7 @@ async def get_monthly_trend(
 ) -> list[MonthlyTrend]:
     filtered = account_ids is not None
     acct_filter = [Transaction.account_id.in_(account_ids)] if filtered else []
-    today = date.today()
+    today = app_today()
     accounting_mode = await get_credit_card_accounting_mode(session)
     report_date = reporting_date_col(accounting_mode)
     month_label = func.to_char(report_date, 'YYYY-MM').label('month')
@@ -1205,7 +1206,7 @@ async def get_projected_transactions(
         range_start, range_end = from_date, to_date + timedelta(days=1)
     else:
         if not month:
-            month = date.today().replace(day=1)
+            month = app_today().replace(day=1)
         range_start, range_end = _month_range(month)
 
     # Get user's primary currency for live conversion
@@ -1401,7 +1402,7 @@ async def _account_balance_at(
     current cutoff: their provider balance is returned verbatim so it keeps
     matching the bank app. Forecast callers add pending/future rows separately.
     """
-    today = date.today()
+    today = app_today()
     balance_cutoff = min(cutoff, today)
     if account.connection_id:
         # Start from the provider's authoritative current balance
@@ -1414,15 +1415,18 @@ async def _account_balance_at(
         if cutoff >= today:
             return current_bal
 
-        # Coverage: an account with no movement before this cutoff had no
-        # balance then — a card opened last month had no debt a year ago.
-        # Extrapolating before the data invented retroactive debt.
+        # Coverage: an account has no balance before the month its first
+        # movement lands in — a card opened last month had no debt a year
+        # ago, and extrapolating before the data invented retroactive debt.
+        # The line is the month, not the day: a cutoff just before the first
+        # movement still rewinds the provider's current balance, which is
+        # what shared credit lines rely on to be counted once.
         first_movement = await session.scalar(
             select(func.min(Transaction.date)).where(
                 Transaction.account_id == account.id,
             )
         )
-        if first_movement is not None and cutoff < first_movement:
+        if first_movement is not None and cutoff < first_movement.replace(day=1):
             return 0.0
 
         # Investment accounts carry their value in the Assets ledger: their
@@ -1497,7 +1501,7 @@ async def _total_balance_by_currency(
     if not accounts:
         return {}
 
-    today = date.today()
+    today = app_today()
     balance_cutoff = min(cutoff, today)
     connected = [account for account in accounts if account.connection_id]
     manual = [account for account in accounts if not account.connection_id]
@@ -1566,9 +1570,13 @@ async def _total_balance_by_currency(
                 include_ignored_categories=True,
             )
 
-    # Coverage per account (mirrors _account_balance_at): an account with no
-    # movement before the cutoff had no balance then, and an investment
-    # account's shelf is its stated balance at every snapshot.
+    # Coverage per account (mirrors _account_balance_at): the account has no
+    # balance before the month its first movement lands in, and an investment
+    # account's shelf is its stated balance at every snapshot. Coverage is
+    # monthly, not daily: a cutoff a day or two before the first movement
+    # must still rewind the provider's current balance (a shared credit line
+    # is counted once by rewinding exactly that way), while months of
+    # invented history stay zeroed.
     first_movements: dict[uuid.UUID, date] = {}
     if accounts:
         coverage_rows = await session.execute(
@@ -1579,6 +1587,7 @@ async def _total_balance_by_currency(
         first_movements = {row[0]: row[1] for row in coverage_rows.all()}
 
     totals: dict[str, float] = {}
+    balances: dict[uuid.UUID, float] = {}
     for account in accounts:
         if account.connection_id:
             bal = float(account.balance)
@@ -1586,7 +1595,7 @@ async def _total_balance_by_currency(
                 bal = -bal
             if cutoff < today:
                 first = first_movements.get(account.id)
-                if first is not None and cutoff < first:
+                if first is not None and cutoff < first.replace(day=1):
                     bal = 0.0
                 elif account.type != "investment":
                     bal -= connected_deltas.get(account.id, 0.0)
@@ -1594,7 +1603,24 @@ async def _total_balance_by_currency(
                         bal -= connected_pending.get(account.id, 0.0)
         else:
             bal = manual_sums.get(account.id, 0.0)
-        totals[account.currency] = totals.get(account.currency, 0) + bal
+        balances[account.id] = bal
+
+    grouped: dict[str, list[Account]] = {}
+    for account in accounts:
+        key = account.shared_balance_group or str(account.id)
+        grouped.setdefault(key, []).append(account)
+
+    for group in grouped.values():
+        total = sum(balances[account.id] for account in group)
+        if len(group) > 1 and group[0].shared_balance_group:
+            # Every card in the group carries the same shared debt, so `total`
+            # counts it len(group) times; strip the duplicates.
+            current_shared = await _account_balance_at(
+                session, group[0], today, include_pending=include_pending
+            )
+            total -= current_shared * (len(group) - 1)
+        currency = group[0].currency
+        totals[currency] = totals.get(currency, 0) + total
     return totals
 
 
@@ -1669,7 +1695,7 @@ async def _daily_balance_deltas_by_date(
             Account.type != "investment",
             Transaction.date >= start,
             Transaction.date < end,
-            Transaction.date <= date.today(),
+            Transaction.date <= app_today(),
             Transaction.is_ignored == False,
             *status_filter,
             *( [Transaction.account_id.in_(account_ids)] if account_ids is not None else [] ),
@@ -1719,13 +1745,13 @@ async def get_balance_history(
     account_ids: Optional[list[uuid.UUID]] = None,
 ) -> BalanceHistory:
     if not month:
-        month = date.today().replace(day=1)
+        month = app_today().replace(day=1)
 
     month_start, month_end = _month_range(month)
     prev_month_start = (month_start - timedelta(days=1)).replace(day=1)
     prev_month_end = month_start
 
-    today = date.today()
+    today = app_today()
     is_current = month_start.year == today.year and month_start.month == today.month
     days_in_month = (month_end - month_start).days
     cutoff_day = today.day if is_current else days_in_month
