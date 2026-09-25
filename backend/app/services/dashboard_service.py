@@ -118,6 +118,7 @@ async def _get_recurring_projections(
     account_ids: Optional[list[uuid.UUID]] = None,
     *,
     include_transfer_like: bool = False,
+    transfer_like_only: bool = False,
 ) -> list[dict]:
     """Compute virtual recurring transaction projections for a month.
     Pure read — no DB writes. Returns list of dicts with category_id, amount, type, currency.
@@ -140,7 +141,10 @@ async def _get_recurring_projections(
             Category.is_ignored.is_not(True),
         ),
     ]
-    if not include_transfer_like:
+    if transfer_like_only:
+        # The other half of the same coin: only what the P&L shape drops.
+        filters.append(Category.treat_as_transfer.is_(True))
+    elif not include_transfer_like:
         filters.append(or_(
             RecurringTransaction.category_id.is_(None),
             Category.treat_as_transfer.is_not(True),
@@ -679,6 +683,22 @@ async def get_summary(
         else:
             projected_expenses_primary += abs(float(forecast_converted))
 
+    # Money leaving for another of the person's own accounts — an investment
+    # contribution, say — is not spending, but it is cash on the move, and
+    # the drill-down lists it. Naming it separately is what lets the closing
+    # sentence add up to that screen without calling an investment a cost.
+    projected_transfers_primary = 0.0
+    for proj in await _get_recurring_projections(
+        session, workspace_id, month_start, month_end, account_ids,
+        transfer_like_only=True,
+    ):
+        if proj["type"] != "debit":
+            continue
+        converted, _ = await convert(
+            session, Decimal(str(proj["amount"])), proj["currency"], primary_currency,
+        )
+        projected_transfers_primary += float(converted)
+
     # Aggregate the user's net pending balance across all groups they
     # participate in. We reuse the group balance computation so partial
     # settlements are already netted out.
@@ -704,6 +724,7 @@ async def get_summary(
         projected_expenses=abs(projected_monthly_expenses),
         projected_income_primary=round(projected_income_primary, 2),
         projected_expenses_primary=round(projected_expenses_primary, 2),
+        projected_transfers_primary=round(projected_transfers_primary, 2),
         accounts_count=accounts_count,
         pending_categorization=pending_categorization,
         pending_categorization_amount=pending_categorization_amount,

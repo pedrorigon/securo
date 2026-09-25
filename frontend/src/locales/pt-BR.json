@@ -568,7 +568,8 @@
     "forecastReceivedLabel": "você receberá",
     "forecastSpentLabel": "gastará",
     "forecastBalanceLabel": "saldo de",
-    "forecastRateLabel": "taxa de economia de"
+    "forecastRateLabel": "taxa de economia de",
+    "forecastInvestedLabel": "e investirá"
   },
   "transactions": {
     "title": "Transações",

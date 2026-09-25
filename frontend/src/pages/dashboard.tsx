@@ -439,6 +439,7 @@ export default function DashboardPage() {
   const forecast = spendingForecast(
     Number(summary?.projected_income_primary ?? summary?.projected_income ?? 0),
     Number(summary?.projected_expenses_primary ?? summary?.projected_expenses ?? 0),
+    Number(summary?.projected_transfers_primary ?? 0),
   )
 
   // Uncategorized data
@@ -997,6 +998,15 @@ export default function DashboardPage() {
             <span className="font-medium text-rose-500">
               {mask(formatCurrency(forecast.spent, primaryCurrency, locale))}
             </span>
+            {forecast.invested > 0 && (
+              <>
+                {' '}
+                {t('dashboard.forecastInvestedLabel')}{' '}
+                <span className="font-medium text-rose-500">
+                  {mask(formatCurrency(forecast.invested, primaryCurrency, locale))}
+                </span>
+              </>
+            )}
             {t('dashboard.forecastResulting')}{' '}
             {t('dashboard.forecastBalanceLabel')}{' '}
             <span

@@ -17,6 +17,10 @@ class DashboardSummary(BaseModel):
     projected_expenses: float = 0.0
     projected_income_primary: float = 0.0
     projected_expenses_primary: float = 0.0
+    #: Expected outflow to the person's own other accounts (transfer-like
+    #: recurring projections), in the primary currency. Not spending — named
+    #: separately so the closing sentence can match the movements panel.
+    projected_transfers_primary: float = 0.0
     accounts_count: int
     pending_categorization: int
     pending_categorization_amount: float

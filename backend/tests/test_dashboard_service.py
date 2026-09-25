@@ -1238,3 +1238,39 @@ async def test_same_currency_rows_use_their_own_amount(
     # The pending row rides the forecast with its own amount too, so the
     # home's "gastará" matches the panel's "total exibido".
     assert summary.projected_expenses_primary == pytest.approx(183.33)
+
+
+@pytest.mark.asyncio
+async def test_transfer_like_projections_are_named_separately(
+    session: AsyncSession, test_user, test_workspace
+):
+    """An investment contribution is not spending, but it is cash leaving —
+    the panel lists it, so the summary reports it on its own line instead of
+    letting the two screens silently disagree."""
+    transfer_cat = await _make_category(session, test_user.id, "Investments", color="#111")
+    transfer_cat.treat_as_transfer = True
+    await session.commit()
+    account = await _make_account(session, test_user.id, "Transfers")
+    month_start = date.today().replace(day=1)
+
+    session.add(RecurringTransaction(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        description="Aporte",
+        amount=Decimal("2000"),
+        currency="BRL",
+        type="debit",
+        frequency="monthly",
+        start_date=month_start,
+        next_occurrence=month_start,
+        is_active=True,
+        category_id=transfer_cat.id,
+        account_id=account.id,
+    ))
+    await session.commit()
+
+    summary = await get_summary(session, test_workspace.id, test_user.id, month=month_start)
+    assert summary.projected_transfers_primary == pytest.approx(2000.0)
+    # The P&L figure stays clean: an investment is not a cost.
+    assert summary.projected_expenses_primary == pytest.approx(0.0)

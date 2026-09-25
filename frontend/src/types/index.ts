@@ -213,6 +213,7 @@ export interface AccountSummary {
   monthly_expenses_primary: number | null
   projected_income?: number
   projected_expenses?: number
+  projected_transfers_primary?: number | null
   projected_income_primary?: number | null
   projected_expenses_primary?: number | null
 }
@@ -732,6 +733,7 @@ export interface DashboardSummary {
   monthly_expenses_primary: number
   projected_income?: number
   projected_expenses?: number
+  projected_transfers_primary?: number | null
   projected_income_primary?: number
   projected_expenses_primary?: number
   accounts_count: number

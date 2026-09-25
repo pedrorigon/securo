@@ -572,7 +572,8 @@
     "forecastReceivedLabel": "you will receive",
     "forecastSpentLabel": "will spend",
     "forecastBalanceLabel": "balance of",
-    "forecastRateLabel": "savings rate of"
+    "forecastRateLabel": "savings rate of",
+    "forecastInvestedLabel": "and will invest"
   },
   "transactions": {
     "title": "Транзакції",
